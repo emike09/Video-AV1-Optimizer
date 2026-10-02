@@ -1,4 +1,4 @@
-# 🎬 Media AV1 Optimizer
+# 🎬 Video AV1 Optimizer
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#-license)
 [![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg?logo=powershell&logoColor=white)](https://github.com/PowerShell/PowerShell)
