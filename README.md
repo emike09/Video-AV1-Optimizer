@@ -5,7 +5,8 @@
 [![FFmpeg 9+](https://img.shields.io/badge/FFmpeg-9.0.1%2B-007808.svg)](https://www.gyan.dev/ffmpeg/builds/)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](#requirements)
 
-**Convert an H.264/H.265 library to AV1 and make the files smaller without losing anything you can see.**
+**Convert common video files to AV1 and make the files smaller without losing anything you can see.**  
+[View supported containers and codecs →](SUPPORTED-FORMATS.md)
 
 That is the whole goal, and the thing that makes this different from a batch script is the second half of it. Most tools answer *"how big will this be?"* with a bitrate heuristic. This one encodes short samples, **measures** them against the source with VMAF or XPSNR, and searches for the highest CRF that still looks the same — then hands that to the size projection, which keeps its veto.
 
@@ -124,7 +125,7 @@ So the script does not treat "no CRF was transparent" as "this file cannot be co
 
 | | |
 |---|---|
-| **[Quality targeting](docs/quality.md)** | How the CRF search works, VMAF vs XPSNR, why XPSNR is anchored, what to do about grain, all quality settings |
+| **[Supported formats](SUPPORTED-FORMATS.md)** | Accepted containers, explicitly tuned codecs, other FFmpeg-decodable inputs, and fidelity limits |\n| **[Quality targeting](docs/quality.md)** | How the CRF search works, VMAF vs XPSNR, why XPSNR is anchored, what to do about grain, all quality settings |
 | **[HDR and Dolby Vision](docs/hdr.md)** | Static HDR10 metadata, HDR10+, HLG, the MaxCLL sanity check, DV profile handling |
 | **[The seven tools](docs/tools.md)** | What each tool is for, plus deep dives on finding candidates and loudness normalisation |
 | **[Settings reference](docs/settings.md)** | Every setting, Auto mode, film grain, SVT-AV1 efficiency, preflight, NVENC |
