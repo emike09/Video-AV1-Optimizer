@@ -12,8 +12,6 @@ That is the whole goal, and the thing that makes this different from a batch scr
 
 One PowerShell file and a launcher. Drag files on to encode; double-click for a menu.
 
-> Built for large English-language media libraries where quality, automation and safe batch handling all matter.
-
 ---
 
 ## What it does
