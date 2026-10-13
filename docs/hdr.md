@@ -29,7 +29,7 @@ The optional MaxCLL sanity clamp is **off** by default. Its defaults require a m
 ## Optional external tools
 
 - `hdr10plus_tool.exe`: HDR10+ extraction/injection support.
-- `dovi_tool.exe`: additional Dolby Vision inspection and workflow support.
+- `dovi_tool.exe`: discovered and its path recorded, but not invoked by the current pipeline. Dolby Vision conversion uses FFmpeg bitstream filters such as `dovi_split` and `dovi_rpu`; installing this binary cannot replace missing FFmpeg capabilities.
 
 `HdrToolsDir` can name their directory. Otherwise discovery includes the script directory and PATH. The project README describes release packaging; check the actual archive you downloaded rather than assuming these tools are installed globally. They are separate projects with their own licenses.
 

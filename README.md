@@ -41,7 +41,7 @@ One PowerShell file and a launcher. Drag files on to Video2AV1Queue.bat; or doub
 
 Most full builds — gyan.dev "full", BtbN "gpl" — have everything needed. FFmpeg 8.x runs with **reduced capability** and says so; 6.x / 7.x and "essentials" builds are not supported. The **Doctor** tool tells you exactly what your build can do.
 
-Two optional binaries unlock HDR10+ preservation and richer Dolby Vision logging — dovi_tool.exe and hdr10plus_tool.exe. These are bundled in the release, but feel free to obtain them yourself if needed.
+The release bundles hdr10plus_tool.exe for HDR10+ preservation and dovi_tool.exe. The current script discovers dovi_tool but does not invoke it; Dolby Vision conversion relies on FFmpeg bitstream filters. See [HDR documentation](docs/hdr.md#optional-external-tools).
 
 ---
 

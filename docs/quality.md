@@ -22,7 +22,7 @@ The default permitted anchor drops are 0.5 VMAF points and 0.25 dB XPSNR. XPSNR 
 
 ## Search bounds and cost
 
-Defaults are two 15-second sample positions, up to three additional search passes, a maximum six-CRF step, and a range from the initial Auto CRF to at most twelve CRF above it. The default lower allowance is zero (`QualityMaxCrfBelowAuto`); the ceiling can be pinned separately. Reporting the second metric adds a measurement at the selected setting.
+Defaults are two 15-second sample positions, up to three additional search passes, a maximum six-CRF step, and a range from eight CRF below the initial Auto CRF to twelve above it. The default lower allowance is eight (`QualityMaxCrfBelowAuto`); the ceiling can be pinned separately. Reporting the second metric adds a measurement at the selected setting.
 
 More samples improve coverage but cost decoding, encoding and metric work. Even GPU encoding can leave substantial CPU work in metric calculation. See the [complete defaults](settings.md) before changing bounds.
 
