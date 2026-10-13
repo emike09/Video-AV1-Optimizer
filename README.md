@@ -17,7 +17,7 @@ One PowerShell file and a launcher. Drag files on to encode; double-click for a 
 ## What it does
 
 - **AV1 via SVT-AV1 or NVIDIA NVENC**, chosen per file, with concurrent workers
-- **Measured quality targeting** — the CRF is searched for and verified, not guessed ([how](docs/quality.md))
+- **Measured quality targeting** — the CRF is searched for and verified, not guessed
 - **Honest about the metric's limits** — where an absolute VMAF target cannot discriminate (grainy film transfers), the file is converted at the Auto CRF rather than refused, and the run says so
 - **HDR10 static metadata survives** the re-encode — mastering display colour volume, MaxCLL/MaxFALL
 - **Dolby Vision converted, not skipped** — Profiles 7, 8 and 10 become correct HDR10; Profile 5 is refused by design
