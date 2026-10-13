@@ -1678,7 +1678,27 @@ function Get-QsvEnvironment {
     }
 }
 
+function Test-GpuVendorMayBePresent {
+    param([ValidateSet('8086','10DE')][string]$VendorId)
+    # A successful Windows inventory can rule out an absent vendor before
+    # FFmpeg emits driver/device errors. Unknown inventory still gets probed.
+    if (-not $IsWindows) { return $true }
+    try {
+        $adapters = @(Get-CimInstance Win32_VideoController -ErrorAction Stop)
+        if ($adapters.Count -eq 0) { return $true }
+        foreach ($adapter in $adapters) {
+            $id = [string](Get-OptionalProperty $adapter 'PNPDeviceID' '')
+            if ([string]::IsNullOrWhiteSpace($id) -or $id -match "(?i)VEN_$VendorId(?:&|$)") { return $true }
+        }
+        return $false
+    } catch { return $true }
+}
+
 function Try-Get-QsvEnvironment {
+    if (-not (Test-GpuVendorMayBePresent -VendorId '8086')) {
+        $script:QsvUnavailableReason = 'No Intel GPU detected.'
+        return $null
+    }
     try { return Get-QsvEnvironment } catch {
         $script:QsvUnavailableReason = $_.Exception.Message
         Write-Host "Intel AV1 lane unavailable: $script:QsvUnavailableReason" -ForegroundColor DarkGray
@@ -2423,6 +2443,7 @@ function Test-NvencFallbackSuitable {
 }
 
 function Try-Get-NvencEnvironment {
+    if (-not (Test-GpuVendorMayBePresent -VendorId '10DE')) { return $null }
     # Absence of NVIDIA hardware is normal on an Intel machine. Do not launch
     # a CUDA/NVENC probe just to discover nvcuda.dll is absent.
     $smi = Get-NvidiaSmiPath
@@ -13091,7 +13112,7 @@ param(
 
     # Which lane the time estimate assumes. CPU is the conservative answer and
     # the one that matters for a big backlog; Nvidia is much faster per file.
-    [ValidateSet('CPU', 'Nvidia')]
+    [ValidateSet('CPU', 'Nvidia', 'Intel')]
     [string]$Lane = 'CPU',
 
     # Full results as CSV.
@@ -13163,6 +13184,13 @@ if ([string]::IsNullOrWhiteSpace($HistoryCsv)) {
 $script:HistorySavings = @{}   # "tier|codecClass|bppTier" -> @{ Median; Count }
 $script:HistorySpeed   = @{}   # "tier|lane"              -> @{ Median; Count }
 $script:HistoryRows    = 0
+$calibration = Read-EncodeCalibration
+if ($calibration) {
+    Write-Host ("Calibration  : {0} | lanes: {1}" -f $calibration.CreatedUtc, (($calibration.Results | ForEach-Object { $_.Lane }) -join ', ')) -ForegroundColor DarkCyan
+    if (-not @($calibration.Results | Where-Object { $_.Lane -eq $Lane }).Count) {
+        Write-Warning "No calibration for $Lane; its speed needs learned history or uses built-in estimates."
+    }
+}
 
 function Get-MedianOf {
     param($Values)
@@ -13241,7 +13269,7 @@ if (Test-Path -LiteralPath $HistoryCsv) {
         Write-Warning ("Could not read encode history ({0}); falling back to built-in estimates." -f $_.Exception.Message)
     }
 } else {
-    Write-Host "History      : none yet -- using built-in estimates, which are priors, not measurements." -ForegroundColor Yellow
+    Write-Host "History      : none yet -- savings use built-in estimates; speeds use calibration when available." -ForegroundColor Yellow
     Write-Host "               Re-run this after a few dozen encodes and the numbers become yours." -ForegroundColor DarkGray
 }
 Write-Host ''
@@ -13279,7 +13307,7 @@ function Get-FallbackSpeedFactor {
         'HD'    { 0.45 }
         default { 1.10 }
     }
-    if ($LaneName -eq 'Nvidia') { return $cpu * 8.0 }
+    if ($LaneName -in @('Nvidia','Intel')) { return $cpu * 8.0 }
     return $cpu
 }
 
@@ -13302,7 +13330,7 @@ function Resolve-ExpectedReduction {
 }
 
 function Resolve-SpeedFactor {
-    param([string]$ResolutionTier, [string]$LaneName)
+    param([string]$ResolutionTier, [string]$LaneName, [int]$Width, [int]$Height, [double]$FrameRate)
 
     $key = "{0}|{1}" -f $ResolutionTier, $LaneName
     if ($script:HistorySpeed.ContainsKey($key) -and $script:HistorySpeed[$key].Count -ge 3) {
@@ -13312,6 +13340,8 @@ function Resolve-SpeedFactor {
             Count  = [int]$script:HistorySpeed[$key].Count
         }
     }
+    $measured = Resolve-CalibrationSpeed -Calibration $calibration -Lane $LaneName -Width $Width -Height $Height -FrameRate $FrameRate
+    if ($measured) { return $measured }
     return [pscustomobject]@{
         Factor = (Get-FallbackSpeedFactor -ResolutionTier $ResolutionTier -LaneName $LaneName)
         Source = 'estimate'
@@ -13568,7 +13598,7 @@ foreach ($probeResult in $probeResults) {
     $videoShare = $videoBytes / [double]$sourceItem.Length
 
     $reduction = Resolve-ExpectedReduction -ResolutionTier $tier -CodecClass $codecClass -BppTier $bppTier
-    $speed     = Resolve-SpeedFactor -ResolutionTier $tier -LaneName $Lane
+    $speed     = Resolve-SpeedFactor -ResolutionTier $tier -LaneName $Lane -Width $width -Height $height -FrameRate ([double]$sourceProfile.FrameRate)
 
     # Capped at the video portion: the whole-file reduction learned from history
     # already reflects some average audio share, and applying it to a file whose
@@ -13602,6 +13632,7 @@ foreach ($probeResult in $probeResults) {
         ExpectedSavingPct = [Math]::Round($reduction.Percent, 1)
         SavingSource      = ("{0}{1}" -f $reduction.Source, $(if ($reduction.Count -gt 0) { " n=$($reduction.Count)" } else { '' }))
         ExpectedSavedGiB  = [Math]::Round($savedGiB, 3)
+        EstimateLane      = $Lane
         EncodeHours       = [Math]::Round($encodeHours, 2)
         SpeedSource       = ("{0}{1}" -f $speed.Source, $(if ($speed.Count -gt 0) { " n=$($speed.Count)" } else { '' }))
         PayoffGiBPerHour  = [Math]::Round($payoff, 3)
@@ -13676,6 +13707,7 @@ if ($estimatedRows -eq $rows.Count) {
 } else {
     Write-Host 'All saving figures came from your own encode history.' -ForegroundColor Green
 }
+Write-Host 'Encode-hours assume the selected lane sequentially. Calibration excludes quality search/remux; scaled speeds are rough.' -ForegroundColor DarkYellow
 Write-Host 'These are predictions. The preflight and quality search still decide per file,' -ForegroundColor DarkGray
 Write-Host 'and can still refuse a file this list likes -- that is them working correctly.' -ForegroundColor DarkGray
 
@@ -15519,6 +15551,134 @@ Write-Host ""
 # Bench
 # Merged from Video2AV1Queue-Bench.ps1. Body unchanged; see Build-Single.ps1.
 # =============================================================================
+function Get-CalibrationSettingsKey {
+    $values = foreach ($name in @('CRF','Preset','FilmGrain','AutoCRFOffset','SoftwareTune','SoftwareKeyintSeconds','SoftwareVarianceBoost','SoftwareVarianceBoostStrength','SoftwareFilmGrainDenoise','SoftwarePinCores','CpuMaxParallel','NvencPreset','NvencCQ','NvencTune','NvencDecode','QsvPreset','QsvICQ','QsvDecode','QsvAdapter')) {
+        '{0}={1}' -f $name,(Get-Variable -Name $name -ValueOnly)
+    }
+    $binary=Get-Item -LiteralPath $FfmpegPath -ErrorAction Stop
+    return (($values -join ';') + ';ffmpeg=' + $binary.Length + ':' + $binary.LastWriteTimeUtc.Ticks)
+}
+
+
+function Get-CalibrationMachineKey {
+    # Local calibration must not silently travel with a copied script/profile.
+    $parts = @([Environment]::MachineName, [Environment]::ProcessorCount, [Runtime.InteropServices.RuntimeInformation]::OSArchitecture)
+    if ($IsWindows) {
+        $parts += @(Get-CimInstance Win32_Processor -ErrorAction Stop | ForEach-Object { $_.Name })
+        $parts += @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Sort-Object Name | ForEach-Object { "$($_.Name)|$($_.DriverVersion)" })
+    }
+    return ($parts -join ';')
+}
+
+function Read-EncodeCalibration {
+    param([string]$Path = (Join-Path $PSScriptRoot '.queue\calibration.json'))
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $data = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 20
+        if ($data.Schema -ne 1 -or $data.Machine -ne (Get-CalibrationMachineKey) -or $data.SettingsKey -ne (Get-CalibrationSettingsKey)) {
+            Write-Host 'Calibration hardware, driver, settings or FFmpeg changed; run calibration again.' -ForegroundColor DarkYellow
+            return $null
+        }
+        if ($data.Width -le 0 -or $data.Height -le 0 -or $data.FrameRate -le 0 -or @($data.Results).Count -eq 0) { throw 'Invalid calibration dimensions/results.' }
+        foreach ($result in $data.Results) {
+            $factor=[double]$result.Factor
+            if ($result.Lane -notin @('CPU','Nvidia','Intel') -or $factor -le 0 -or [double]::IsNaN($factor) -or [double]::IsInfinity($factor)) { throw 'Invalid calibration speed/lane.' }
+        }
+        return $data
+    } catch {
+        Write-Warning "Calibration ignored: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Resolve-CalibrationSpeed {
+    param($Calibration, [string]$Lane, [int]$Width, [int]$Height, [double]$FrameRate)
+    if (-not $Calibration -or $Width -le 0 -or $Height -le 0 -or $FrameRate -le 0) { return $null }
+    $measurement = @($Calibration.Results | Where-Object { $_.Lane -eq $Lane -and $_.Factor -gt 0 }) | Select-Object -First 1
+    if (-not $measurement) { return $null }
+    # Pixel throughput scaling is only a rough extrapolation, explicitly labelled.
+    $scale = ([double]$Calibration.Width * $Calibration.Height * $Calibration.FrameRate) / ([double]$Width * $Height * $FrameRate)
+    $label = if ($Width -eq $Calibration.Width -and $Height -eq $Calibration.Height -and [Math]::Abs($FrameRate - $Calibration.FrameRate) -lt 0.1) { 'calibration' } else { 'calibration-pixel-scaled' }
+    return [pscustomobject]@{Factor=([double]$measurement.Factor * $scale);Source=$label;Count=[int]$measurement.Repeats}
+}
+
+function Invoke-CalibrationTool {
+    param([Parameter(Mandatory)][string]$Source, [ValidateRange(2,120)][int]$SampleSeconds=20, [ValidateRange(1,5)][int]$Repeat=2,
+        [string]$CalibrationPath=(Join-Path $PSScriptRoot '.queue\calibration.json'))
+    $Source = (Get-Item -LiteralPath $Source -ErrorAction Stop).FullName
+    $probe = Invoke-FfprobeJson -InputPath $Source
+    $video = @($probe.streams | Where-Object { $_.codec_type -eq 'video' -and (Get-OptionalProperty $_.disposition 'attached_pic' 0) -ne 1 }) | Select-Object -First 1
+    if (-not $video) { throw 'No video stream in calibration source.' }
+    $selected = @{Video=$video}
+    $profile = Get-SourceProfile -Probe $probe -VideoStream $video -InputPath $Source
+    $dv = Resolve-DolbyVisionSourcePlan -Probe $probe -VideoStream $video
+    if ($dv.IsDolbyVision) { throw 'Choose an SDR or HDR10 source for speed calibration; Dolby Vision conversion requires the full metadata workflow.' }
+    $duration = Convert-ToInvariantDouble (Get-OptionalProperty $probe.format 'duration' 0) 0
+    if ($duration -lt 2) { throw 'Calibration needs at least two seconds of video.' }
+    $seconds = [int][Math]::Min($SampleSeconds, [Math]::Floor($duration))
+    $start = [Math]::Min($duration * 0.35, $duration - $seconds)
+    $auto = Get-AutoEncodeSettings -Probe $probe -VideoStream $video -SourceProfile $profile -InputPath $Source -ConfiguredCRF $CRF -ConfiguredPreset $Preset -ConfiguredFilmGrain $FilmGrain -ConfiguredAutoCRFOffset $AutoCRFOffset
+    $fps = [double]$profile.FrameRate
+    if ($fps -le 0) { throw 'Cannot determine calibration frame rate.' }
+    $environments = @{CPU=$null; Nvidia=(Try-Get-NvencEnvironment); Intel=(Try-Get-QsvEnvironment)}
+    $work = Join-Path ([IO.Path]::GetTempPath()) ('av1-calibration-'+[guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $work
+    $results = [Collections.Generic.List[object]]::new()
+    Write-Host "Calibration: same ${seconds}s segment on each available encoder, $Repeat measured runs each." -ForegroundColor Cyan
+    Write-Host 'Run with other encodes idle. Measures decode + encode, excluding quality search, audio and final remux.' -ForegroundColor DarkYellow
+    foreach ($lane in @('CPU','Nvidia','Intel')) {
+        $environment = $environments[$lane]
+        if ($lane -ne 'CPU' -and -not $environment) { continue }
+        try {
+            $mode = switch ($lane) { CPU {'software'} Nvidia {'nvenc'} Intel {'qsv'} }
+            $settings = $null
+            if ($lane -eq 'Intel') {
+                $plan = Resolve-QsvDecodePlan -InputPath $Source -Selected $selected -HdrPlan $null -Environment $environment
+                $settings = Convert-SoftwareQualityToQsvSettings -CRF $auto.CRF -DecodePlan $plan
+            } elseif ($lane -eq 'Nvidia') {
+                $settings = Convert-SoftwareQualityToNvencSettings -AutoSettings $auto -SourceProfile $profile -ConfiguredNvencPreset $NvencPreset -ConfiguredNvencCQ $NvencCQ -ConfiguredNvencTune $NvencTune -ConfiguredNvencDecode $NvencDecode -NvencEnvironment $environment
+            }
+            $factors = [Collections.Generic.List[double]]::new()
+            for ($run=1; $run -le $Repeat; $run++) {
+                Write-Host "$lane calibration $run/$Repeat..." -ForegroundColor Cyan
+                $output = Join-Path $work "$lane-$run.mkv"
+                $arguments = Build-PreflightSampleArgs -InputPath $Source -Selected $selected -SourceProfile $profile -EncodeMode $mode -StartSec $start -DurationSec $seconds -ResolvedCRF $auto.CRF -ResolvedPreset $auto.Preset -ResolvedFilmGrain $auto.FilmGrain -NvencSettings $settings -NvencEnvironment $environment -OutputPath $output
+                $psi = [Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName=$FfmpegPath; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+                $psi.RedirectStandardError=$true; $psi.RedirectStandardOutput=$true
+                foreach ($arg in $arguments) { $null=$psi.ArgumentList.Add($arg) }
+                $sw=[Diagnostics.Stopwatch]::StartNew()
+                $process=[Diagnostics.Process]::Start($psi)
+                try {
+                    $err=$process.StandardError.ReadToEndAsync(); $stdout=$process.StandardOutput.ReadToEndAsync()
+                    if (-not $process.WaitForExit(1800000)) { $process.Kill($true); throw 'Calibration encode exceeded 30 minutes.' }
+                    $sw.Stop(); $detail=$err.GetAwaiter().GetResult(); $null=$stdout.GetAwaiter().GetResult()
+                    if ($process.ExitCode -ne 0) { throw ($detail.Substring([Math]::Max(0,$detail.Length-1200))) }
+                } finally { $process.Dispose() }
+                $outProbe=Invoke-FfprobeJson -InputPath $output
+                $outDuration=Convert-ToInvariantDouble (Get-OptionalProperty $outProbe.format 'duration' 0) 0
+                if ($outDuration -lt ($seconds * 0.9) -or $outProbe.streams[0].codec_name -ne 'av1') { throw 'Incomplete or invalid calibration encode.' }
+                $factors.Add($outDuration / $sw.Elapsed.TotalSeconds)
+                Remove-Item -LiteralPath $output
+            }
+            $factor=($factors | Measure-Object -Average).Average
+            $results.Add([pscustomobject]@{Lane=$lane;Factor=$factor;Repeats=$Repeat;CRF=$auto.CRF;CpuPreset=$auto.Preset;FilmGrain=$auto.FilmGrain;Settings=$settings})
+            Write-Host ('{0}: {1:F2}x realtime' -f $lane,$factor) -ForegroundColor Green
+        } catch { Write-Warning "$lane calibration failed; no measurement saved for this lane: $($_.Exception.Message)" }
+    }
+    if ($results.Count -eq 0) { throw "All calibration lanes failed. Existing calibration retained. Diagnostics workspace: $work" }
+    $data=[ordered]@{Schema=1;Machine=(Get-CalibrationMachineKey);SettingsKey=(Get-CalibrationSettingsKey);CreatedUtc=[DateTime]::UtcNow.ToString('o');Source=$Source;Width=[int]$video.width;Height=[int]$video.height;FrameRate=$fps;SampleSeconds=$seconds;Results=$results.ToArray()}
+    $null=New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CalibrationPath)
+    if (Test-Path -LiteralPath $CalibrationPath) { Copy-Item -LiteralPath $CalibrationPath -Destination ($CalibrationPath+'.bak') -Force }
+    $temporary=$CalibrationPath+'.tmp'
+    $data | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $temporary -Encoding utf8
+    Move-Item -LiteralPath $temporary -Destination $CalibrationPath -Force
+    Write-Host "Saved: $CalibrationPath" -ForegroundColor Green
+    Write-Host 'Candidates uses history first, then these speeds. Savings still use history or built-in estimates.'
+    Write-Host 'Different content/settings, simultaneous lanes and quality checks can change actual completion time.' -ForegroundColor DarkYellow
+}
+
+
 function Invoke-BenchTool {
 param(
     [string]$Source = '',
@@ -16898,7 +17058,7 @@ function Show-ToolsMenu {
         Write-Host '  [3] Loudness       Measure audio levels, and even them out'
         Write-Host '  [4] Quality        Calibrate the quality thresholds against your own films'
         Write-Host '  [5] Library scan   HDR / Dolby Vision census of a library'
-        Write-Host '  [6] Benchmark      Find the fastest CPU threading for this machine'
+        Write-Host '  [6] Benchmark      Calibrate CPU/GPU speeds or test CPU threading'
         Write-Host '  [7] Verify         End-to-end self-test on throwaway copies'
         Write-Host ''
         Write-Host '  [B] Back'
@@ -16949,7 +17109,9 @@ function Invoke-CandidatesMenuAction {
     $csv = Join-Path $PSScriptRoot ('candidates_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     $list = Join-Path $PSScriptRoot ('candidates_{0}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-    Invoke-CandidatesTool -Path $paths -Csv $csv -OutList $list
+    Write-Host 'Estimate encoding time for which lane? CPU, Nvidia, or Intel (one worker; not mixed Auto scheduling).'
+    $lane = Read-MenuChoice -Prompt 'Estimate lane (Enter = CPU)' -Valid @('CPU','Nvidia','Intel') -Default 'CPU'
+    Invoke-CandidatesTool -Path $paths -Csv $csv -OutList $list -Lane $lane
 
     Write-Host ''
     if ((Test-Path -LiteralPath $list) -and (Read-Confirmation -Prompt 'Queue the shortlist for encoding now?')) {
@@ -17020,6 +17182,17 @@ function Invoke-LibraryScanMenuAction {
 
 function Invoke-BenchMenuAction {
     Write-MenuHeader 'Benchmark'
+    Write-Host '  [1] Calibrate CPU + available GPUs for Candidates estimates'
+    Write-Host '  [2] CPU threading comparison (existing benchmark)'
+    Write-Host '  [B] Back'
+    $kind = Read-MenuChoice -Prompt 'Benchmark type' -Valid @('1','2','B')
+    if ($kind -eq 'B') { return }
+    if ($kind -eq '1') {
+        $files = Read-PathList -Prompt 'One representative video file'
+        if ($files.Count -ne 1) { throw 'Choose exactly one video file for calibration.' }
+        Invoke-CalibrationTool -Source $files[0]
+        return
+    }
     Write-Host 'Measures SVT-AV1 threading on this machine to answer whether one wide encode'
     Write-Host 'or two narrower ones finish more work per hour. Takes a while.' -ForegroundColor DarkGray
 
