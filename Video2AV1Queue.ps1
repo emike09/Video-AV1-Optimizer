@@ -110,7 +110,7 @@ $script:QsvUnavailableReason = ''
 $NvencMaxParallel = Auto          # Max simultaneous NVENC workers. 1-8 or Auto. Auto uses GPU model/engine lookup.
 $NvencCQ = Auto                   # NVENC quality target. 0-51, recommend 18-28, or Auto. Lower = better quality / larger files.
 $NvencPreset = Auto               # NVENC speed/compression setting. p1-p7 or Auto. Higher preset = slower / better compression.
-$NvencDecode = Auto               # Decode path for NVENC jobs. Auto | cpu | cuda. Auto prefers the safest path.
+$NvencDecode = Auto               # Decode path for NVENC jobs. Auto | cpu | cuda. Auto probes hardware decode per source; cpu disables it; cuda requires it.
 $NvencTune = 'auto'               # NVENC tuning bias. auto | hq | ll | ull | $null. hq = quality, ll/ull = latency-focused.
 $NvencAllowSplitFrame = $false    # Allow split-frame NVENC if supported. $false recommended; $true is advanced/testing only.
 
@@ -2058,6 +2058,62 @@ function Resolve-NvencTune {
     }
 }
 
+function Add-NvdecInputArguments {
+    param($ArgumentList, $Settings)
+    if ($Settings.DecodePath -ne 'cuda') { return }
+    $index = [int]$Settings.VideoIndex
+    $ArgumentList.AddRange([string[]]@("-hwaccel:$index",'cuda',"-hwaccel_output_format:$index",'cuda',"-c:$index",$Settings.Decoder))
+}
+
+function Add-NvencPixelArguments {
+    param($ArgumentList, $Settings)
+    if ($Settings.DecodePath -eq 'cuda') {
+        $format = if ($Settings.BitDepth -ge 10) { 'p010le' } else { 'nv12' }
+        $ArgumentList.AddRange([string[]]@('-vf',"scale_cuda=format=$format",'-pix_fmt','cuda'))
+    } else { $ArgumentList.AddRange([string[]]@('-pix_fmt',$Settings.PixFmt)) }
+}
+
+function Resolve-NvdecPlan {
+    param([string]$InputPath, $Selected, $HdrPlan, $SourceProfile)
+    $cpu = @{DecodePath='cpu';Decoder='';VideoIndex=[int]$Selected.Video.index;DecodeReason='CPU decoding selected by configuration.'}
+    if ($NvencDecode -eq 'cpu') { return $cpu }
+    $codec = [string](Get-OptionalProperty $Selected.Video 'codec_name' '')
+    $decoders = @{h264='h264_cuvid';hevc='hevc_cuvid';av1='av1_cuvid';vp9='vp9_cuvid';vp8='vp8_cuvid';mpeg2video='mpeg2_cuvid';mpeg1video='mpeg1_cuvid';vc1='vc1_cuvid';mjpeg='mjpeg_cuvid'}
+    if (-not $decoders.ContainsKey($codec)) {
+        $cpu.DecodeReason="No NVIDIA hardware decoder configured for '$codec'; using CPU decoding."
+        if ($NvencDecode -eq 'cuda') { throw $cpu.DecodeReason }
+        return $cpu
+    }
+    $source=Get-Item -LiteralPath $InputPath
+    $bsf=[string](Get-OptionalProperty $HdrPlan 'InputBitstreamFilter' '')
+    $depth=if ($SourceProfile.HasHDR -or $SourceProfile.SourceBitDepth -ge 10) {10} else {8}
+    $key="$($source.FullName)|$($source.Length)|$($source.LastWriteTimeUtc.Ticks)|$($cpu.VideoIndex)|$codec|$bsf|$depth"
+    $cache=Get-Variable -Name NvdecPlanCache -Scope Script -ErrorAction SilentlyContinue
+    if (-not $cache) { $script:NvdecPlanCache=@{} }
+    if ($script:NvdecPlanCache.ContainsKey($key)) {
+        $cached=$script:NvdecPlanCache[$key]
+        if ($NvencDecode -eq 'cuda' -and $cached.DecodePath -ne 'cuda') { throw $cached.DecodeReason }
+        return $cached
+    }
+    $plan=@{DecodePath='cuda';Decoder=$decoders[$codec];VideoIndex=$cpu.VideoIndex;DecodeReason='NVIDIA hardware decode / CUDA conversion / AV1 encode probe passed.';BitDepth=$depth}
+    $argsList=[Collections.Generic.List[string]]::new()
+    $argsList.AddRange([string[]]@('-hide_banner','-loglevel','error','-nostdin'))
+    Add-NvdecInputArguments -ArgumentList $argsList -Settings $plan
+    if ($bsf) { $argsList.AddRange([string[]]@('-bsf:v',$bsf)) }
+    $argsList.AddRange([string[]]@('-i',$InputPath,'-map',"0:$($cpu.VideoIndex)",'-an','-sn','-dn','-frames:v','8','-c:v','av1_nvenc','-preset','p4','-cq','30'))
+    Add-NvencPixelArguments -ArgumentList $argsList -Settings $plan
+    $argsList.AddRange([string[]]@('-f','null','-'))
+    $probe=Invoke-QsvCapabilityProbe -Arguments $argsList.ToArray() -TimeoutSeconds 30
+    if (-not $probe.Success) {
+        $cpu.DecodeReason="NVIDIA decode pipeline unavailable; using CPU decoding. $($probe.Detail)"
+        if ($NvencDecode -eq 'cuda') { throw $cpu.DecodeReason }
+        $plan=$cpu
+    }
+    $script:NvdecPlanCache[$key]=$plan
+    return $plan
+}
+
+
 function Convert-SoftwareQualityToNvencSettings {
     param(
         $AutoSettings,
@@ -2103,16 +2159,13 @@ function Convert-SoftwareQualityToNvencSettings {
     $tune = $tuneResolution.Tune
     $tuneReason = $tuneResolution.Reason
 
-    $decodePath = $ConfiguredNvencDecode
-    $decodeReason = "Manual: using configured decode path $ConfiguredNvencDecode."
-    if ($ConfiguredNvencDecode -eq 'Auto') {
-        $decodePath = 'cpu'
-        $decodeReason = 'Auto: CPU decode selected for maximum compatibility and filter-path reliability.'
-    } elseif ($ConfiguredNvencDecode -eq 'cuda' -and -not $NvencEnvironment.SupportsCudaHwaccel) {
-        $decodePath = 'cpu'
-        $decodeReason = 'Requested CUDA decode is not supported by this FFmpeg build; falling back to CPU decode.'
+    $decodePlan = Get-OptionalProperty $NvencEnvironment 'DecodePlan' $null
+    $decodePath = 'cpu'
+    $decodeReason = 'CPU decoding; no source-specific NVIDIA decode probe available.'
+    if ($ConfiguredNvencDecode -ne 'cpu' -and $decodePlan) {
+        $decodePath = $decodePlan.DecodePath
+        $decodeReason = $decodePlan.DecodeReason
     }
-
     $pixFmt = if ($SourceProfile.HasHDR -or $AutoSettings.BitDepth -ge 10) { 'p010le' } else { 'yuv420p' }
     $bitDepth = if ($pixFmt -eq 'p010le') { 10 } else { 8 }
 
@@ -2144,6 +2197,8 @@ function Convert-SoftwareQualityToNvencSettings {
         TuneReason       = $tuneReason
         TuneWarning      = $tuneResolution.Warning
         TuneDisplay      = if ([string]::IsNullOrWhiteSpace([string]$tune)) { 'disabled' } else { $tune }
+        Decoder          = (Get-OptionalProperty $decodePlan 'Decoder' '')
+        VideoIndex       = (Get-OptionalProperty $decodePlan 'VideoIndex' 0)
         DecodePath       = $decodePath
         DecodeReason     = $decodeReason
         PixFmt           = $pixFmt
@@ -5125,7 +5180,7 @@ function Build-PreflightSampleArgs {
 
     if ($EncodeMode -eq 'qsv') { Add-QsvDecodeArguments -ArgumentList $ffArgs -Settings $NvencSettings }
     if ($EncodeMode -eq 'nvenc' -and $NvencSettings -and $NvencSettings.DecodePath -eq 'cuda') {
-        $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
+        Add-NvdecInputArguments -ArgumentList $ffArgs -Settings $nvencSettings
     }
 
     # The Dolby Vision base-layer filter changes what the encoder sees, so a
@@ -5165,7 +5220,7 @@ function Build-PreflightSampleArgs {
         if ($NvencEnvironment.SupportsSplitEncode -and -not $NvencAllowSplitFrame) {
             $ffArgs.AddRange([string[]]@('-split_encode_mode', 'disabled'))
         }
-        $ffArgs.AddRange([string[]]@('-pix_fmt', $NvencSettings.PixFmt))
+        Add-NvencPixelArguments -ArgumentList $ffArgs -Settings $NvencSettings
         if ($NvencEnvironment.SupportsHighBitDepth -and $NvencSettings.BitDepth -ge 10) {
             $ffArgs.AddRange([string[]]@('-highbitdepth', '1'))
         }
@@ -8498,6 +8553,11 @@ function Get-EncodeInitialization {
         $NvencEnvironment.DecodePlan = Resolve-QsvDecodePlan -InputPath $InputPath -Selected $selected -HdrPlan $hdrPlan -Environment $NvencEnvironment
         Write-SessionTextLogMessage -Level Info -Message ("Intel decode | {0} | {1}" -f $NvencEnvironment.DecodePlan.DecodePath, $NvencEnvironment.DecodePlan.DecodeReason)
     }
+    if ($EncodeMode -eq 'nvenc') {
+        $NvencEnvironment = @{} + $NvencEnvironment
+        $NvencEnvironment.DecodePlan = Resolve-NvdecPlan -InputPath $InputPath -Selected $selected -HdrPlan $hdrPlan -SourceProfile $sourceProfile
+        Write-SessionTextLogMessage -Level Info -Message ("NVIDIA decode | {0} | {1}" -f $NvencEnvironment.DecodePlan.DecodePath, $NvencEnvironment.DecodePlan.DecodeReason)
+    }
     if ($EncodeMode -eq 'qsv' -and $hdrPlan.IsHdr -and $PreserveHdrStaticMetadata -and
         $hdrPlan.StaticMetadata -and ($hdrPlan.StaticMetadata.HasMasteringDisplay -or $hdrPlan.StaticMetadata.HasContentLight) -and
         -not $hdrPlan.CarryStaticMetadata) {
@@ -10080,7 +10140,7 @@ function Build-NvencFfmpegArgs {
     $ffArgs.Add('-y')
 
     if ($nvencSettings.DecodePath -eq 'cuda') {
-        $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
+        Add-NvdecInputArguments -ArgumentList $ffArgs -Settings $nvencSettings
     }
 
     # Same Dolby Vision base-layer handling as the software lane: applied on the
@@ -10148,7 +10208,7 @@ function Build-NvencFfmpegArgs {
         $ffArgs.AddRange([string[]]@('-split_encode_mode', 'disabled'))
     }
 
-    $ffArgs.AddRange([string[]]@('-pix_fmt', $nvencSettings.PixFmt))
+    Add-NvencPixelArguments -ArgumentList $ffArgs -Settings $nvencSettings
     if ($NvencEnvironment.SupportsHighBitDepth -and $nvencSettings.BitDepth -ge 10) {
         $ffArgs.AddRange([string[]]@('-highbitdepth', '1'))
     }
@@ -15580,7 +15640,7 @@ function Get-CalibrationSettingsKey {
         '{0}={1}' -f $name,(Get-Variable -Name $name -ValueOnly)
     }
     $binary=Get-Item -LiteralPath $FfmpegPath -ErrorAction Stop
-    return (($values -join ';') + ';ffmpeg=' + $binary.Length + ':' + $binary.LastWriteTimeUtc.Ticks)
+    return (($values -join ';') + ';nvdecPipeline=1;ffmpeg=' + $binary.Length + ':' + $binary.LastWriteTimeUtc.Ticks)
 }
 
 
@@ -15660,6 +15720,8 @@ function Invoke-CalibrationTool {
                 $plan = Resolve-QsvDecodePlan -InputPath $Source -Selected $selected -HdrPlan $null -Environment $environment
                 $settings = Convert-SoftwareQualityToQsvSettings -CRF $auto.CRF -DecodePlan $plan
             } elseif ($lane -eq 'Nvidia') {
+                $environment = @{} + $environment
+                $environment.DecodePlan = Resolve-NvdecPlan -InputPath $Source -Selected $selected -HdrPlan $null -SourceProfile $profile
                 $settings = Convert-SoftwareQualityToNvencSettings -AutoSettings $auto -SourceProfile $profile -ConfiguredNvencPreset $NvencPreset -ConfiguredNvencCQ $NvencCQ -ConfiguredNvencTune $NvencTune -ConfiguredNvencDecode $NvencDecode -NvencEnvironment $environment
             }
             $factors = [Collections.Generic.List[double]]::new()
