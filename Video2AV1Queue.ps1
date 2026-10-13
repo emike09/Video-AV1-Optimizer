@@ -41,7 +41,7 @@ param(
     [string]$TargetGiBPerHourOverride = '',
 
     # Encoder lane for this drop, supplied by the Interactive menu.
-    # Auto | CPU | Nvidia, or empty to defer to the $EncoderPreference setting.
+    # Auto | CPU | Nvidia | Intel, or empty to defer to the $EncoderPreference setting.
     #
     # Attached to each queued job rather than held in a global, for the same
     # reason as the CRF override: a drop queued as CPU must still encode on the
@@ -87,7 +87,7 @@ $FilmGrain = Auto      # AV1 film grain synthesis strength. 0-50, recommend 0-16
 # ------------------------------------------------------------------------
 # Encoder lanes
 # ------------------------------------------------------------------------
-$EncoderPreference = 'Auto'       # Preferred encoder path. Auto | CPU | Nvidia. Auto chooses per file.
+$EncoderPreference = 'Auto'       # Preferred encoder path. Auto | CPU | Nvidia | Intel. Auto chooses per file.
 $CpuMaxParallel = 1              # Simultaneous CPU (SVT-AV1) encodes. 1-4. Read the CPU parallelism note below first.
 $SoftwarePinCores = 0            # Cores per CPU encode, via svtav1-params pin. 0 = no pinning. Only meaningful when $CpuMaxParallel > 1.
 $SoftwareEncodePriority = 'BelowNormal' # Priority for CPU software encodes. Idle | BelowNormal | Normal | AboveNormal.
@@ -98,6 +98,15 @@ $ApplyProcessPriority   = $true         # Apply the priority settings above. $tr
 # ------------------------------------------------------------------------
 # NVENC
 # ------------------------------------------------------------------------
+$QsvMaxParallel = 1              # Intel AV1 workers. Start with 1; increase after hardware testing.
+$QsvICQ = Auto                   # Intel ICQ 1-51 or Auto; lower = higher quality. Not NVENC CQ or SVT CRF.
+$QsvDecode = 'Auto'              # Auto probes each file; cpu disables HW decode; qsv requires HW decode.
+$script:QsvDecodeCache = @{}
+$QsvPreset = 'slow'              # veryfast | faster | fast | medium | slow | slower | veryslow
+$QsvAdapter = 'Auto'             # Auto selects Intel by vendor on Windows; or a DXGI adapter index.
+$script:QsvEnvironment = $null
+$script:QsvUnavailableReason = ''
+
 $NvencMaxParallel = Auto          # Max simultaneous NVENC workers. 1-8 or Auto. Auto uses GPU model/engine lookup.
 $NvencCQ = Auto                   # NVENC quality target. 0-51, recommend 18-28, or Auto. Lower = better quality / larger files.
 $NvencPreset = Auto               # NVENC speed/compression setting. p1-p7 or Auto. Higher preset = slower / better compression.
@@ -466,6 +475,8 @@ $LogColumns = @(
     'ResolvedPreset',
     'ResolvedFilmGrain',
     'ResolvedCQ',
+    'QsvICQ',
+    'QsvPreset',
     'ResolvedNvencPreset',
     'ResolvedNvencTune',
     'ResolvedDecodePath',
@@ -532,131 +543,96 @@ $MutexName = "Global\PlexAV1QueueMutex"
 # =============================================================================
 # Tool discovery
 # Prefers ffmpeg / ffprobe placed next to the script (portable deployment),
-# then falls back to whatever is on PATH.  If neither location works, asks the
-# user to supply the path interactively and (optionally) adds it to the user's
-# PATH so the prompt never fires again.
+# then falls back to whatever is on PATH.
 # =============================================================================
-$FfmpegPath  = Join-Path $PSScriptRoot "ffmpeg.exe"
-$FfprobePath = Join-Path $PSScriptRoot "ffprobe.exe"
+function Add-FFmpegPathEntry {
+    param([AllowNull()][string]$ExistingPath, [string]$Directory)
+    $separator = [IO.Path]::PathSeparator
+    foreach ($entry in ($ExistingPath -split [regex]::Escape([string]$separator))) {
+        $normalized = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"')).TrimEnd('\','/')
+        if ([string]::Equals($normalized, $Directory.TrimEnd('\','/'), [StringComparison]::OrdinalIgnoreCase)) {
+            return $ExistingPath
+        }
+    }
+    if ([string]::IsNullOrEmpty($ExistingPath)) { return $Directory }
+    if ($ExistingPath.EndsWith([string]$separator)) { return $ExistingPath + $Directory }
+    return $ExistingPath + $separator + $Directory
+}
 
-if (-not (Test-Path -LiteralPath $FfmpegPath)) {
-    $ffmpegCmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
-    if ($ffmpegCmd) {
-        $FfmpegPath = $ffmpegCmd.Source
+function Set-FFmpegUserPath {
+    param([string]$Directory)
+    # Update this process immediately; persistent changes alone do not refresh
+    # a terminal that is already open. Never copy the combined process PATH
+    # into the user PATH, which would duplicate machine-level entries.
+    $env:PATH = Add-FFmpegPathEntry -ExistingPath $env:PATH -Directory $Directory
+    if ($IsWindows) {
+        try {
+            $existing = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $updated = Add-FFmpegPathEntry -ExistingPath $existing -Directory $Directory
+            if ($updated -cne $existing) { [Environment]::SetEnvironmentVariable('Path', $updated, 'User') }
+            Write-Host "FFmpeg folder added to this session and your user PATH: $Directory" -ForegroundColor Green
+        } catch {
+            Write-Warning "FFmpeg is available for this session, but saving your user PATH failed: $($_.Exception.Message)"
+        }
     } else {
-        # ---- interactive fallback ----
-        Write-Host ""
-        Write-Host "================================================================" -ForegroundColor Yellow
-        Write-Host " ffmpeg.exe was not found next to this script or in PATH." -ForegroundColor Yellow
-        Write-Host "================================================================" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "Download a full FFmpeg build from:" -ForegroundColor White
-        Write-Host "  https://www.gyan.dev/ffmpeg/builds/  (gyan.dev 'full' build)" -ForegroundColor Cyan
-        Write-Host "  https://github.com/BtbN/FFmpeg-Builds/releases  (BtbN 'gpl' build)" -ForegroundColor Cyan
-        Write-Host ""
-
-        $resolvedFfmpegDir = $null
-        while ($null -eq $resolvedFfmpegDir) {
-            Write-Host "Enter the full path to ffmpeg.exe, or the folder that contains it:" -ForegroundColor White
-            $rawInput = Read-Host "Path"
-            $rawInput = $rawInput.Trim().Trim('"').Trim("'")
-
-            if ([string]::IsNullOrWhiteSpace($rawInput)) {
-                Write-Host "No path entered. Please try again." -ForegroundColor Yellow
-                continue
-            }
-
-            # Accept either the exe itself or its containing folder
-            $candidate = $rawInput
-            if ([System.IO.Path]::GetFileName($candidate) -eq 'ffmpeg.exe') {
-                $candidate = [System.IO.Path]::GetDirectoryName($candidate)
-            }
-
-            $testFfmpeg  = Join-Path $candidate "ffmpeg.exe"
-            $testFfprobe = Join-Path $candidate "ffprobe.exe"
-
-            if (-not (Test-Path -LiteralPath $testFfmpeg)) {
-                Write-Host "ffmpeg.exe not found in: $candidate" -ForegroundColor Red
-                Write-Host "Please check the path and try again." -ForegroundColor Yellow
-                continue
-            }
-            if (-not (Test-Path -LiteralPath $testFfprobe)) {
-                Write-Host "ffmpeg.exe was found but ffprobe.exe was not in the same folder." -ForegroundColor Red
-                Write-Host "Both executables must be in the same directory. Please try again." -ForegroundColor Yellow
-                continue
-            }
-
-            $resolvedFfmpegDir = $candidate
-        }
-
-        $FfmpegPath  = Join-Path $resolvedFfmpegDir "ffmpeg.exe"
-        $FfprobePath = Join-Path $resolvedFfmpegDir "ffprobe.exe"
-
-        Write-Host ""
-        Write-Host "Found ffmpeg and ffprobe in: $resolvedFfmpegDir" -ForegroundColor Green
-        Write-Host ""
-        Write-Host "Would you like to add this folder to your user PATH so it is found automatically next time?" -ForegroundColor White
-        Write-Host "  [Y] Yes - add to user PATH (does NOT require admin rights)" -ForegroundColor White
-        Write-Host "  [N] No  - use this path for this session only" -ForegroundColor White
-        Write-Host ""
-
-        $addToPath = $null
-        while ($null -eq $addToPath) {
-            $pathResponse = (Read-Host "Add to user PATH? [Y/N] (default N)").Trim().ToUpperInvariant()
-            if ([string]::IsNullOrWhiteSpace($pathResponse) -or $pathResponse -eq 'N') {
-                $addToPath = $false
-            } elseif ($pathResponse -eq 'Y') {
-                $addToPath = $true
-            } else {
-                Write-Host "Please enter Y or N." -ForegroundColor Yellow
-            }
-        }
-
-        if ($addToPath) {
-            try {
-                $regKey  = 'HKCU:\Environment'
-                $current = (Get-ItemProperty -Path $regKey -Name Path -ErrorAction SilentlyContinue).Path
-                if ([string]::IsNullOrWhiteSpace($current)) {
-                    $newPath = $resolvedFfmpegDir
-                } else {
-                    # Only add if not already present (case-insensitive)
-                    $existing = $current -split ';' | Where-Object { $_ -ne '' }
-                    if ($existing | Where-Object { $_.TrimEnd('\') -ieq $resolvedFfmpegDir.TrimEnd('\') }) {
-                        Write-Host "Folder is already in your user PATH." -ForegroundColor DarkGray
-                        $newPath = $null
-                    } else {
-                        $newPath = ($existing + $resolvedFfmpegDir) -join ';'
-                    }
-                }
-
-                if ($null -ne $newPath) {
-                    Set-ItemProperty -Path $regKey -Name Path -Value $newPath -Type ExpandString
-                    # Refresh PATH for this session so Get-Command would find it now
-                    $env:PATH = ($env:PATH.TrimEnd(';') + ';' + $resolvedFfmpegDir)
-                    Write-Host "User PATH updated. New sessions will find ffmpeg automatically." -ForegroundColor Green
-                }
-            } catch {
-                Write-Warning "Could not update user PATH: $($_.Exception.Message)"
-                Write-Warning "You can add '$resolvedFfmpegDir' to your PATH manually via System Properties."
-            }
-        }
-
-        Write-Host ""
+        Write-Host "FFmpeg folder added to this session's PATH: $Directory" -ForegroundColor Green
     }
 }
 
-# Resolve ffprobe from the same directory as ffmpeg when ffmpeg was found on
-# PATH or via interactive prompt (FfprobePath may still point to script dir).
-if (-not (Test-Path -LiteralPath $FfprobePath)) {
-    $ffprobeInSameDir = Join-Path ([System.IO.Path]::GetDirectoryName($FfmpegPath)) "ffprobe.exe"
-    if (Test-Path -LiteralPath $ffprobeInSameDir) {
-        $FfprobePath = $ffprobeInSameDir
-    } else {
-        $ffprobeCmd = Get-Command ffprobe -ErrorAction SilentlyContinue
-        if (-not $ffprobeCmd) { throw "ffprobe.exe not found next to ffmpeg.exe, next to this script, or in PATH." }
-        $FfprobePath = $ffprobeCmd.Source
+function Resolve-FFmpegTools {
+    param([string]$ScriptDirectory, [string]$ToolFolder = '')
+    $suffix = if ($IsWindows) { '.exe' } else { '' }
+    $found = @{}
+    foreach ($name in @('ffmpeg','ffprobe')) {
+        $local = Join-Path $ScriptDirectory ($name + $suffix)
+        if (Test-Path -LiteralPath $local -PathType Leaf) {
+            $found[$name] = [IO.Path]::GetFullPath($local)
+        } else {
+            $command = Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($command) { $found[$name] = $command.Source }
+        }
+    }
+    if ($found.Count -eq 2 -and [string]::IsNullOrWhiteSpace($ToolFolder)) {
+        return [pscustomobject]@{ Ffmpeg = $found.ffmpeg; Ffprobe = $found.ffprobe }
+    }
+    Write-Host 'FFmpeg setup: locate a folder containing both ffmpeg and ffprobe.' -ForegroundColor Yellow
+    Write-Host 'For example: C:\ffmpeg or C:\ffmpeg\bin. You can also paste the full path to ffmpeg.exe.'
+    Write-Host 'The selected folder will be added to this session and, on Windows, your user PATH (no administrator rights needed).'
+    while ($true) {
+        $entered = $ToolFolder
+        if ([string]::IsNullOrWhiteSpace($entered)) {
+            try { $entered = Read-Host 'FFmpeg folder (blank cancels)' }
+            catch { throw 'FFmpeg/ffprobe were not found and no interactive input is available. Place them next to the script or add their folder to PATH.' }
+        }
+        if ([string]::IsNullOrWhiteSpace($entered)) { throw 'FFmpeg setup cancelled. No PATH changes were made.' }
+        try {
+            $candidate = [Environment]::ExpandEnvironmentVariables($entered.Trim().Trim('"').Trim("'"))
+            $item = Get-Item -LiteralPath $candidate -ErrorAction Stop
+            $folder = if ($item.PSIsContainer) { $item.FullName } else { $item.DirectoryName }
+            $resolved = $null
+            foreach ($directory in @($folder, (Join-Path $folder 'bin'))) {
+                $ffmpeg = Join-Path $directory ('ffmpeg' + $suffix)
+                $ffprobe = Join-Path $directory ('ffprobe' + $suffix)
+                if ((Test-Path -LiteralPath $ffmpeg -PathType Leaf) -and (Test-Path -LiteralPath $ffprobe -PathType Leaf)) {
+                    $resolved = [pscustomobject]@{ Ffmpeg = $ffmpeg; Ffprobe = $ffprobe }
+                    break
+                }
+            }
+            if (-not $resolved) { throw 'Both ffmpeg and ffprobe must be present in that folder or its bin subfolder.' }
+            $directory = Split-Path -Parent $resolved.Ffmpeg
+            if ($directory.Contains([string][IO.Path]::PathSeparator)) { throw 'The folder name contains the PATH separator and cannot be added to PATH.' }
+            Set-FFmpegUserPath -Directory $directory
+            return $resolved
+        } catch {
+            if (-not [string]::IsNullOrWhiteSpace($ToolFolder)) { throw }
+            Write-Host "Cannot use that folder: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 }
+
+$mediaTools = Resolve-FFmpegTools -ScriptDirectory $PSScriptRoot
+$FfmpegPath = $mediaTools.Ffmpeg
+$FfprobePath = $mediaTools.Ffprobe
 
 # =============================================================================
 # Queue directory and log initialisation
@@ -862,7 +838,7 @@ function Write-SessionEncodeStart {
 
     if ($null -eq $Init) { return }
 
-    $modeLabel = if ($Init.ResolvedEncodeLane -eq 'Nvidia') { 'NVENC' } else { 'SVT-AV1' }
+    $modeLabel = if ($Init.ResolvedEncodeLane -eq 'Intel') { 'QSV' } elseif ($Init.ResolvedEncodeLane -eq 'Nvidia') { 'NVENC' } else { 'SVT-AV1' }
     Write-SessionTextLogMessage -Level Info -Message ("Starting | {0} -> {1} | Lane {2} | Mode {3}" -f $Init.DisplayInputName, $Init.DisplayOutputName, $Init.ResolvedEncodeLane, $modeLabel)
     Write-SessionTextLogMessage -Level Info -Message ("Lane decision | {0}" -f $Init.LaneSelectionReason)
 
@@ -872,7 +848,10 @@ function Write-SessionEncodeStart {
         Write-SessionTextLogMessage -Level Info -Message ("Color | Source {0} -> Output {1}" -f $sourceColor, $encodeColor)
     }
 
-    if ($Init.ResolvedEncodeLane -eq 'Nvidia' -and $Init.NvencSettings) {
+    if ($Init.ResolvedEncodeLane -eq 'Intel') {
+        Write-SessionTextLogMessage -Level Info -Message ("Intel QSV | ICQ {0} | Preset {1} | 10-bit | Decode {2}" -f $Init.NvencSettings.CQ, $Init.NvencSettings.Preset, $Init.NvencSettings.DecodePath)
+    }
+    elseif ($Init.ResolvedEncodeLane -eq 'Nvidia' -and $Init.NvencSettings) {
         Write-SessionTextLogMessage -Level Info -Message ("Output settings | CQ {0} | NVENC {1} | Tune {2} | Decode {3} | Priority {4}" -f $Init.NvencSettings.CQ, $Init.NvencSettings.Preset, $Init.NvencSettings.TuneDisplay, $Init.NvencSettings.DecodePath, $Init.WorkerProcessPriority)
     } else {
         Write-SessionTextLogMessage -Level Info -Message ("Output settings | CRF {0} | Preset {1} | FilmGrain {2} | Priority {3}" -f $Init.PreflightWorkflow.FinalResolvedCRF, $Init.PreflightWorkflow.FinalResolvedPreset, $Init.EffectiveFilmGrain, $Init.WorkerProcessPriority)
@@ -992,19 +971,22 @@ function Resolve-EncoderPreferenceConfigValue {
     )
 
     if ($null -eq $Value) {
-        throw "$Name must be one of: Auto, CPU, Nvidia."
+        throw "$Name must be one of: Auto, CPU, Nvidia, Intel."
     }
 
     $text = ([string]$Value).Trim()
     if ([string]::IsNullOrWhiteSpace($text)) {
-        throw "$Name must be one of: Auto, CPU, Nvidia."
+        throw "$Name must be one of: Auto, CPU, Nvidia, Intel."
     }
 
     switch ($text.ToLowerInvariant()) {
         'auto'   { return 'Auto' }
         'cpu'    { return 'CPU' }
         'nvidia' { return 'Nvidia' }
-        default  { throw "$Name must be one of: Auto, CPU, Nvidia. Current value: $Value" }
+        'intel' { return 'Intel' }
+        'qsv' { return 'Intel' }
+        'quicksync' { return 'Intel' }
+        default  { throw "$Name must be one of: Auto, CPU, Nvidia, Intel. Current value: $Value" }
     }
 }
 
@@ -1638,6 +1620,271 @@ function Get-NvencEngineCountFromGpuName {
     }
 }
 
+# Intel Quick Sync integration. NvencSettings/NvencEnvironment are legacy
+# shared preflight parameter names; Encoder identifies their actual backend.
+function Invoke-QsvCapabilityProbe {
+    param([string[]]$Arguments, [int]$TimeoutSeconds = 20)
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $FfmpegPath
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardError = $true
+    $info.RedirectStandardOutput = $true
+    foreach ($arg in $Arguments) { $info.ArgumentList.Add($arg) }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $info
+    try {
+        $null = $process.Start()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process.Kill($true)
+            $process.WaitForExit()
+            return [pscustomobject]@{ Success = $false; Detail = 'Intel AV1 capability probe timed out.' }
+        }
+        $detail = $stderr.GetAwaiter().GetResult() + $stdout.GetAwaiter().GetResult()
+        return [pscustomobject]@{ Success = ($process.ExitCode -eq 0); Detail = $detail.Trim() }
+    } finally { $process.Dispose() }
+}
+
+function Get-QsvEnvironment {
+    # An encoder in -encoders proves build support only. A real hardware-only
+    # 10-bit ICQ encode must also succeed before this lane is scheduled.
+    $help = Invoke-QsvCapabilityProbe -Arguments @('-hide_banner', '-h', 'encoder=av1_qsv')
+    if (-not $help.Success -or $help.Detail -notmatch 'Encoder av1_qsv' -or $help.Detail -notmatch '\bp010le\b') {
+        throw 'FFmpeg must include av1_qsv (oneVPL) with p010le support for Intel AV1 encoding.'
+    }
+    $deviceArgs = [string[]]@('-init_hw_device', 'qsv=av1qsv:hw')
+    if ($IsWindows) {
+        # Select Intel by vendor rather than accidentally choosing an NVIDIA
+        # display adapter. Optional adapter index selects a specific Intel GPU.
+        $device = if ($QsvAdapter -eq 'Auto') { 'd3d11va=av1intel:,vendor_id=0x8086' } else { "d3d11va=av1intel:$QsvAdapter" }
+        $deviceArgs = [string[]]@('-init_hw_device', $device, '-init_hw_device', 'qsv=av1qsv@av1intel')
+    } elseif ($QsvAdapter -ne 'Auto') {
+        throw 'QsvAdapter is a Windows DXGI adapter index; use Auto on other platforms.'
+    }
+    $probeArgs = @('-hide_banner', '-loglevel', 'error', '-nostdin') + $deviceArgs + @(
+        '-f', 'lavfi', '-i', 'testsrc2=size=256x256:rate=24', '-frames:v', '8',
+        '-c:v', 'av1_qsv', '-preset', $QsvPreset, '-global_quality', '24',
+        '-pix_fmt', 'p010le', '-f', 'null', '-')
+    $probe = Invoke-QsvCapabilityProbe -Arguments $probeArgs
+    if (-not $probe.Success) { throw "Intel AV1 10-bit ICQ test failed. Check GPU support and the Intel graphics driver. $($probe.Detail)" }
+    return [ordered]@{
+        Available = $true; Encoder = 'av1_qsv'; Lane = 'Intel'
+        EncoderHelpText = $help.Detail; DeviceArguments = $deviceArgs
+        GpuName = "Intel Quick Sync (adapter $QsvAdapter)"
+        MaxParallel = [int]$QsvMaxParallel; CapacitySource = 'configured'
+        ProbeDetail = 'Passed hardware AV1 / p010le / ICQ test.'
+    }
+}
+
+function Try-Get-QsvEnvironment {
+    try { return Get-QsvEnvironment } catch {
+        $script:QsvUnavailableReason = $_.Exception.Message
+        Write-Host "Intel AV1 lane unavailable: $script:QsvUnavailableReason" -ForegroundColor DarkGray
+        return $null
+    }
+}
+
+function Convert-SoftwareQualityToQsvSettings {
+    param([int]$CRF, $DecodePlan = $null)
+    # This is a starting heuristic, NOT a claim of CRF/ICQ equivalence.
+    # Each quality-search probe maps its own candidate and measures QSV output.
+    $quality = if ($QsvICQ -eq 'Auto') { [Math]::Clamp($CRF, 1, 51) } else { [int]$QsvICQ }
+    return [ordered]@{
+        Encoder = 'av1_qsv'; CQ = $quality; Preset = $QsvPreset
+        PixFmt = 'p010le'; BitDepth = 10; DecodePath = (Get-OptionalProperty $DecodePlan 'DecodePath' 'cpu')
+        Decoder = (Get-OptionalProperty $DecodePlan 'Decoder' '')
+        VideoIndex = (Get-OptionalProperty $DecodePlan 'VideoIndex' 0)
+        DecodeReason = (Get-OptionalProperty $DecodePlan 'DecodeReason' 'CPU decoding')
+        Tune = ''; TuneDisplay = 'ICQ'; TuneReason = 'Intel intelligent constant quality.'
+        TuneWarning = ''; PresetReason = 'Configured QSV preset.'
+        Reason = "Intel ICQ $quality (starting heuristic from CRF $CRF; not an equivalent quality scale)."
+    }
+}
+
+function Add-QsvDecodeArguments {
+    param([Collections.Generic.List[string]]$ArgumentList, $Settings)
+    if ((Get-OptionalProperty $Settings 'DecodePath' 'cpu') -ne 'qsv') { return }
+    $index = [int]$Settings.VideoIndex
+    $ArgumentList.AddRange([string[]]@("-hwaccel:$index", 'qsv',
+        "-hwaccel_device:$index", 'av1qsv', "-hwaccel_output_format:$index", 'qsv',
+        "-c:$index", $Settings.Decoder, '-filter_hw_device', 'av1qsv'))
+}
+
+function Resolve-QsvDecodePlan {
+    param([string]$InputPath, $Selected, $HdrPlan, $Environment)
+    $cpu = @{DecodePath='cpu';Decoder='';VideoIndex=[int]$Selected.Video.index;DecodeReason='CPU decoding selected by configuration.'}
+    if ($QsvDecode -eq 'cpu') { return $cpu }
+    $codec = [string](Get-OptionalProperty $Selected.Video 'codec_name' '')
+    $decoders = @{h264='h264_qsv';hevc='hevc_qsv';av1='av1_qsv';vp9='vp9_qsv';vp8='vp8_qsv';mpeg2video='mpeg2_qsv';vc1='vc1_qsv'}
+    if (-not $decoders.ContainsKey($codec)) {
+        $cpu.DecodeReason="No QSV decoder configured for '$codec'; using CPU decoding."
+        if ($QsvDecode -eq 'qsv') { throw $cpu.DecodeReason }
+        return $cpu
+    }
+    $source = Get-Item -LiteralPath $InputPath
+    $bsf = [string](Get-OptionalProperty $HdrPlan 'InputBitstreamFilter' '')
+    $key = "$($source.FullName)|$($source.Length)|$($source.LastWriteTimeUtc.Ticks)|$($cpu.VideoIndex)|$codec|$bsf|$QsvAdapter|$QsvPreset"
+    if ($script:QsvDecodeCache.ContainsKey($key)) { return $script:QsvDecodeCache[$key] }
+    $plan = @{DecodePath='qsv';Decoder=$decoders[$codec];VideoIndex=$cpu.VideoIndex;DecodeReason='QSV decode / VPP 10-bit / AV1 encode probe passed.'}
+    $argsList = [Collections.Generic.List[string]]::new()
+    $argsList.AddRange([string[]]@('-hide_banner','-loglevel','error','-nostdin'))
+    $argsList.AddRange([string[]]$Environment.DeviceArguments)
+    Add-QsvDecodeArguments -ArgumentList $argsList -Settings $plan
+    if ($bsf) { $argsList.AddRange([string[]]@('-bsf:v',$bsf)) }
+    $argsList.AddRange([string[]]@('-i',$InputPath,'-map',"0:$($plan.VideoIndex)",'-an','-sn','-dn','-frames:v','8'))
+    $settings = Convert-SoftwareQualityToQsvSettings -CRF 24 -DecodePlan $plan
+    Add-QsvVideoArguments -ArgumentList $argsList -Settings $settings
+    $argsList.AddRange([string[]]@('-f','null','-'))
+    $probe = Invoke-QsvCapabilityProbe -Arguments $argsList.ToArray() -TimeoutSeconds 30
+    if (-not $probe.Success) {
+        if ($QsvDecode -eq 'qsv') { throw "QSV hardware decoding failed: $($probe.Detail)" }
+        $cpu.DecodeReason = "Hardware decode pipeline unavailable; using CPU decoding. $($probe.Detail)"
+        $plan = $cpu
+    }
+    $script:QsvDecodeCache[$key] = $plan
+    return $plan
+}
+
+function Test-IntelOnlyPendingQueue {
+    $jobs = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue)
+    if ($jobs.Count -eq 0) { return $false }
+    foreach ($job in $jobs) {
+        try { $preference = Resolve-JobEncoderPreference -Job (Get-Content -LiteralPath $job.FullName -Raw | ConvertFrom-Json) }
+        catch { return $false }
+        if ($preference -ne 'Intel') { return $false }
+    }
+    return $true
+}
+
+function Add-QsvVideoArguments {
+    param([System.Collections.Generic.List[string]]$ArgumentList, $Settings)
+    $ArgumentList.AddRange([string[]]@('-c:v', 'av1_qsv', '-preset', $Settings.Preset,
+        '-global_quality', [string]$Settings.CQ))
+    if ($Settings.DecodePath -eq 'qsv') {
+        # Hardware surfaces stay on the GPU. VPP converts 8-bit inputs to 10-bit
+        # without a software download/format/upload round trip.
+        $ArgumentList.AddRange([string[]]@('-vf','vpp_qsv=format=p010le','-pix_fmt','qsv'))
+    } else {
+        $ArgumentList.AddRange([string[]]@('-pix_fmt','p010le'))
+    }
+}
+
+function Resolve-EncoderLane {
+    param([string]$InputPath, [string]$EncoderPreferenceValue,
+        [bool]$CpuLaneAvailable, [bool]$NvidiaLaneAvailable = $false,
+        $NvencEnvironment = $null, [bool]$IntelLaneAvailable = $false,
+        [string]$AutoCRFOffsetOverrideValue = '', [string]$TargetGiBPerHourOverrideValue = '')
+
+    # Preserve NVIDIA-first ordering on existing systems; fill the Intel lane
+    # when NVIDIA is absent/full. CPU-only suitability remains authoritative.
+    $hardware = $NvencEnvironment
+    $hardwareAvailable = $NvidiaLaneAvailable
+    if ($EncoderPreferenceValue -eq 'Intel' -or
+        ($EncoderPreferenceValue -eq 'Auto' -and $script:QsvEnvironment -and
+         (-not $NvencEnvironment -or (-not $NvidiaLaneAvailable -and $IntelLaneAvailable)))) {
+        $hardware = $script:QsvEnvironment
+        $hardwareAvailable = $IntelLaneAvailable
+    }
+    $lane = if ($EncoderPreferenceValue -eq 'Intel' -or
+        ($hardware -and (Get-OptionalProperty $hardware 'Encoder' '') -eq 'av1_qsv')) { 'Intel' } else { 'Nvidia' }
+    if ($EncoderPreferenceValue -in @('Nvidia', 'Intel') -and -not $hardware -and -not $CpuLaneAvailable) {
+        return [pscustomobject]@{ Ready = $false; Reason = "$lane unavailable; waiting for CPU capacity."; Init = $null }
+    }
+    $result = Resolve-EncoderLaneForHardware -InputPath $InputPath -EncoderPreferenceValue $EncoderPreferenceValue `
+        -CpuLaneAvailable $CpuLaneAvailable -NvidiaLaneAvailable $hardwareAvailable -NvencEnvironment $hardware `
+        -HardwareLane $lane -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue
+    if ($lane -eq 'Intel') {
+        $result.Reason = $result.Reason.Replace('Nvidia', 'Intel').Replace('NVENC', 'QSV')
+        if ($result.Init) {
+            $record = if ($result.Init.EarlyExit) { $result.Init.Row } else { $result.Init }
+            if ($record.Contains('LaneSelectionReason')) { $record.LaneSelectionReason = $record.LaneSelectionReason.Replace('Nvidia', 'Intel').Replace('NVENC', 'QSV') }
+        }
+    }
+    return $result
+}
+
+
+function Build-QsvFfmpegArgs {
+    param(
+        $Init,
+        $NvencEnvironment
+    )
+
+    $NvencEnvironment = $script:QsvEnvironment
+    $selected = $Init.Selected
+    $sourceProfile = $Init.SourceProfile
+    $encodeColorProfile = $Init.EncodeColorProfile
+    $nvencSettings = $Init.NvencSettings
+
+    $hdrPlan = Get-OptionalProperty -InputObject $Init -PropertyName 'HdrPlan' -Default $null
+
+    $ffArgs = New-Object System.Collections.Generic.List[string]
+    $ffArgs.Add('-hide_banner')
+    $ffArgs.Add('-y')
+    $ffArgs.AddRange([string[]]$NvencEnvironment.DeviceArguments)
+    Add-QsvDecodeArguments -ArgumentList $ffArgs -Settings $nvencSettings
+
+
+    # Same Dolby Vision base-layer handling as the software lane: applied on the
+    # input so the decoder never sees the enhancement layer or the RPU.
+    if ($null -ne $hdrPlan -and -not [string]::IsNullOrWhiteSpace($hdrPlan.InputBitstreamFilter)) {
+        $ffArgs.AddRange([string[]]@('-bsf:v', $hdrPlan.InputBitstreamFilter))
+    }
+
+    $ffArgs.AddRange([string[]]@(
+        '-i', $Init.InputPath,
+        '-map', "0:$($selected.Video.index)",
+        '-map', "0:$($selected.MainAudio.index)"
+    ))
+
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@('-map', "0:$($selected.FallbackAudio.index)")) }
+    Add-SubtitleMapArguments -ArgumentList $ffArgs -SubtitlePlan (Get-OptionalProperty -InputObject $Init -PropertyName 'SubtitlePlan' -Default $null)
+
+    $ffArgs.AddRange([string[]]@(
+        '-map_chapters', '0',
+        '-map_metadata', '-1',
+        '-max_muxing_queue_size', '4096'
+    ))
+
+    Add-QsvVideoArguments -ArgumentList $ffArgs -Settings $nvencSettings
+
+    # Colour signalling and the static HDR10 payload now come from the resolved
+    # HDR plan rather than being re-derived here. The old inline derivation
+    # copied the source transfer verbatim, which meant an HLG source was tagged
+    # HLG on this lane but PQ on the software lane -- the two lanes disagreed
+    # about the same file. Add-HdrOutputArguments is the single source of truth.
+    Add-HdrOutputArguments -ArgumentList $ffArgs -HdrPlan $hdrPlan -SourceProfile $sourceProfile
+
+    $ffArgs.AddRange([string[]]@('-c:a', 'copy'))
+    Add-SubtitleOutputArguments -ArgumentList $ffArgs -SubtitlePlan (Get-OptionalProperty -InputObject $Init -PropertyName 'SubtitlePlan' -Default $null)
+
+    $ffArgs.AddRange([string[]]@(
+        '-disposition:v:0', 'default',
+        '-disposition:a:0', 'default'
+    ))
+
+    if ($selected.FallbackAudio) { $ffArgs.AddRange([string[]]@('-disposition:a:1', '0')) }
+
+    $baseTitle  = [System.IO.Path]::GetFileNameWithoutExtension($Init.FinalOutput)
+    $videoTitle = "AV1 QSV $($encodeColorProfile.DynamicRangeLabel) $($encodeColorProfile.BitDepth)-bit"
+    $ffArgs.AddRange([string[]]@(
+        '-metadata',       "title=$baseTitle",
+        '-metadata:s:v:0', "title=$videoTitle",
+        '-metadata:s:a:0', "title=$(Get-StreamTitle $selected.MainAudio)"
+    ))
+
+    if ($selected.FallbackAudio) {
+        $ffArgs.AddRange([string[]]@('-metadata:s:a:1', "title=$(Get-StreamTitle $selected.FallbackAudio)"))
+    }
+
+    $ffArgs.AddRange([string[]]@('-progress', 'pipe:2', '-stats_period', '2'))
+    $ffArgs.Add($Init.TempOutput)
+
+    return ,$ffArgs
+}
+
 function Get-NvencEnvironment {
     $encodersText = (& $FfmpegPath -hide_banner -encoders | Out-String)
     if ($encodersText -notmatch '(?m)\bav1_nvenc\b') {
@@ -1799,6 +2046,9 @@ function Convert-SoftwareQualityToNvencSettings {
         $NvencEnvironment
     )
 
+    if ($NvencEnvironment -and (Get-OptionalProperty $NvencEnvironment 'Encoder' '') -eq 'av1_qsv') {
+        return Convert-SoftwareQualityToQsvSettings -CRF ([int]$AutoSettings.CRF) -DecodePlan (Get-OptionalProperty $NvencEnvironment 'DecodePlan' $null)
+    }
     $softwareCrf = [int]$AutoSettings.CRF
     $cq = if ($ConfiguredNvencCQ -eq 'Auto') {
         [Math]::Max(0, [Math]::Min(63, ($softwareCrf + 8)))
@@ -1892,6 +2142,7 @@ function Get-ResolvedEncodeLaneName {
     param([string]$EncodeMode)
 
     if ($EncodeMode -eq 'nvenc') { return 'Nvidia' }
+    if ($EncodeMode -eq 'qsv') { return 'Intel' }
     return 'CPU'
 }
 
@@ -2116,7 +2367,7 @@ function Test-NvencFallbackSuitable {
     $initAutoSettings  = Get-OptionalProperty -InputObject $Init -PropertyName 'AutoSettings'  -Default $null
     $initLane          = [string](Get-OptionalProperty -InputObject $Init -PropertyName 'ResolvedEncodeLane' -Default '')
 
-    if ($initLane -ne 'Nvidia') {
+    if ($initLane -notin @('Nvidia', 'Intel')) {
         return [pscustomobject][ordered]@{
             Allowed = $true
             Reason  = ''
@@ -2172,6 +2423,12 @@ function Test-NvencFallbackSuitable {
 }
 
 function Try-Get-NvencEnvironment {
+    # Absence of NVIDIA hardware is normal on an Intel machine. Do not launch
+    # a CUDA/NVENC probe just to discover nvcuda.dll is absent.
+    $smi = Get-NvidiaSmiPath
+    if (-not $smi) { return $null }
+    $gpus = @(& $smi --query-gpu=name --format=csv,noheader 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($LASTEXITCODE -ne 0 -or $gpus.Count -eq 0) { return $null }
     try {
         return Get-NvencEnvironment
     } catch {
@@ -2183,7 +2440,7 @@ function Try-Get-NvencEnvironment {
 function Get-WorkerProcessPriorityName {
     param([string]$EncodeMode)
 
-    if ($EncodeMode -eq 'nvenc') { return $HardwareEncodePriority }
+    if ($EncodeMode -in @('nvenc', 'qsv')) { return $HardwareEncodePriority }
     return $SoftwareEncodePriority
 }
 
@@ -2641,7 +2898,9 @@ function Try-RestartHeldWorker {
             Remove-Item -LiteralPath $newInit.TempOutput -Force -ErrorAction SilentlyContinue
         }
 
-        $ffArgs = if ($newInit.ResolvedEncodeLane -eq 'Nvidia') {
+        $ffArgs = if ($newInit.ResolvedEncodeLane -eq 'Intel') {
+        Build-QsvFfmpegArgs -Init $newInit -NvencEnvironment $script:QsvEnvironment
+    } elseif ($newInit.ResolvedEncodeLane -eq 'Nvidia') {
             Build-NvencFfmpegArgs -Init $newInit -NvencEnvironment $NvencEnvironment
         } else {
             Build-SoftwareFfmpegArgs -Init $newInit
@@ -4836,9 +5095,11 @@ function Build-PreflightSampleArgs {
     )
 
     $ffArgs = New-Object System.Collections.Generic.List[string]
+    if ($EncodeMode -eq 'qsv') { $ffArgs.AddRange([string[]]$NvencEnvironment.DeviceArguments) }
     $ffArgs.AddRange([string[]]@('-hide_banner', '-nostdin', '-y',
                                  '-ss', ("{0:0.###}" -f $StartSec), '-t', "$DurationSec"))
 
+    if ($EncodeMode -eq 'qsv') { Add-QsvDecodeArguments -ArgumentList $ffArgs -Settings $NvencSettings }
     if ($EncodeMode -eq 'nvenc' -and $NvencSettings -and $NvencSettings.DecodePath -eq 'cuda') {
         $ffArgs.AddRange([string[]]@('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'))
     }
@@ -4854,7 +5115,11 @@ function Build-PreflightSampleArgs {
 
     $ffArgs.AddRange([string[]]@('-i', $InputPath, '-map', "0:$($Selected.Video.index)", '-an', '-sn', '-dn'))
 
-    if ($EncodeMode -eq 'nvenc') {
+    if ($EncodeMode -eq 'qsv') {
+        # Recompute per candidate: otherwise every quality probe tests the same ICQ.
+        $qsvSettings = Convert-SoftwareQualityToQsvSettings -CRF $ResolvedCRF -DecodePlan $NvencSettings
+        Add-QsvVideoArguments -ArgumentList $ffArgs -Settings $qsvSettings
+    } elseif ($EncodeMode -eq 'nvenc') {
         $ffArgs.AddRange([string[]]@('-c:v', 'av1_nvenc'))
         if ($NvencEnvironment.SupportsPreset -and -not [string]::IsNullOrWhiteSpace($NvencSettings.Preset)) {
             $ffArgs.AddRange([string[]]@('-preset', $NvencSettings.Preset))
@@ -4904,7 +5169,7 @@ function Build-PreflightSampleArgs {
         }
     }
 
-    if ($EncodeMode -ne 'nvenc') {
+    if ($EncodeMode -eq 'software') {
         Add-SvtAv1DolbyVisionSuppression -ArgumentList $ffArgs -HdrPlan $HdrPlan
     }
     Add-HdrOutputArguments -ArgumentList $ffArgs -HdrPlan $HdrPlan -SourceProfile $SourceProfile
@@ -5097,6 +5362,9 @@ function Format-PreflightSettingsLabel {
         $NvencSettings = $null
     )
 
+    if ($EncodeMode -eq 'qsv' -and $NvencSettings) {
+        return "Intel QSV / ICQ $($NvencSettings.CQ) / Preset $($NvencSettings.Preset) / 10-bit / Decode $($NvencSettings.DecodePath)"
+    }
     if ($EncodeMode -eq 'nvenc' -and $NvencSettings) {
         return "CRF $CRF / Preset $Preset / FilmGrain $FilmGrain / CQ $($NvencSettings.CQ) / NVENC $($NvencSettings.Preset)"
     }
@@ -5347,7 +5615,7 @@ function Invoke-PreflightAutoTuneWorkflow {
         QualitySecondMetricValue = 0.0
     }
 
-    if ($EncodeMode -eq 'nvenc') {
+    if ($EncodeMode -in @('nvenc', 'qsv')) {
         $baseNvencAuto = [ordered]@{}
         foreach ($prop in $AutoSettings.Keys) { $baseNvencAuto[$prop] = $AutoSettings[$prop] }
         $baseNvencAuto.CRF = $InitialResolvedCRF
@@ -5366,7 +5634,7 @@ function Invoke-PreflightAutoTuneWorkflow {
         return $workflow
     }
 
-    $allowCrfTune = ($CRF -eq 'Auto')
+    $allowCrfTune = ($CRF -eq 'Auto' -and ($EncodeMode -ne 'qsv' -or $QsvICQ -eq 'Auto'))
     $allowPresetTune = ($Preset -eq 'Auto' -and $EncodeMode -eq 'software')
     $allowFilmGrainTune = ($FilmGrain -eq 'Auto' -and $EncodeMode -eq 'software')
     $preflightTargets = Resolve-PreflightAutoTuneTargets -QualityProfile $PreflightAutoTuneQuality -ResolutionTier $AutoSettings.ResolutionTier -SourceProfile $SourceProfile `
@@ -5441,7 +5709,7 @@ function Invoke-PreflightAutoTuneWorkflow {
                     $workflow.WasPreflightRetuned = $true
                     $currentCrf = [int]$search.ChosenCRF
                     $workflow.FinalResolvedCRF = $currentCrf
-                    if ($EncodeMode -eq 'nvenc') {
+                    if ($EncodeMode -in @('nvenc', 'qsv')) {
                         $qualityNvencAuto = [ordered]@{}
                         foreach ($prop in $AutoSettings.Keys) { $qualityNvencAuto[$prop] = $AutoSettings[$prop] }
                         $qualityNvencAuto.CRF = $currentCrf
@@ -5535,7 +5803,7 @@ function Invoke-PreflightAutoTuneWorkflow {
             $workflow.FinalResolvedPreset = $currentPreset
             $workflow.FinalResolvedFilmGrain = $currentFilmGrain
 
-            if ($EncodeMode -eq 'nvenc') {
+            if ($EncodeMode -in @('nvenc', 'qsv')) {
                 $retunedNvencAuto = [ordered]@{}
                 foreach ($prop in $AutoSettings.Keys) { $retunedNvencAuto[$prop] = $AutoSettings[$prop] }
                 $retunedNvencAuto.CRF = $currentCrf
@@ -5550,7 +5818,7 @@ function Invoke-PreflightAutoTuneWorkflow {
             }
 
             if ($EnableSecondPreflightPass) {
-                $currentNvencSettings = if ($EncodeMode -eq 'nvenc') { $workflow.FinalNvencSettings } else { $null }
+                $currentNvencSettings = if ($EncodeMode -in @('nvenc', 'qsv')) { $workflow.FinalNvencSettings } else { $null }
                 $workflow.Preflight2 = Invoke-PreflightEstimate `
                     -InputPath $InputPath `
                     -Selected $Selected `
@@ -6572,7 +6840,7 @@ function Resolve-HdrEncodePlan {
         if ($toolchain.SupportsStaticMetadataOptions) {
             $plan.CarryStaticMetadata = $true
             $plan.StaticMetadataRoute = 'ffmpeg_options'
-        } elseif ($EncodeMode -ne 'nvenc') {
+        } elseif ($EncodeMode -eq 'software') {
             $plan.CarryStaticMetadata = $true
             $plan.StaticMetadataRoute = 'svtav1_params'
             $plan.Notes.Add('FFmpeg build lacks -mastering_display / -content_light; carrying static HDR10 metadata through svtav1-params instead.')
@@ -6607,9 +6875,9 @@ function Resolve-HdrEncodePlan {
         # lane. Rather than set a flag nobody enforces and then silently drop the
         # metadata, fall through to post-encode injection when this job is
         # already committed to NVENC, and only give up if that is unavailable too.
-        $inlineAvailable = $toolchain.SupportsSvtHdr10PlusJson -and $toolchain.Hdr10PlusToolPath -and ($EncodeMode -ne 'nvenc')
+        $inlineAvailable = $toolchain.SupportsSvtHdr10PlusJson -and $toolchain.Hdr10PlusToolPath -and ($EncodeMode -eq 'software')
 
-        if ($EncodeMode -eq 'nvenc' -and $toolchain.SupportsSvtHdr10PlusJson) {
+        if ($EncodeMode -in @('nvenc', 'qsv') -and $toolchain.SupportsSvtHdr10PlusJson) {
             $plan.RequiresCpuLane       = $true
             $plan.RequiresCpuLaneReason = 'HDR10+ can be carried inline only by the SVT-AV1 (CPU) lane; the Nvidia lane needs post-encode injection.'
         }
@@ -7002,7 +7270,7 @@ function Get-QualityLogFields {
     # this is free, and it records what was actually emitted rather than what
     # some earlier stage believed would be.
     $efficiency = ''
-    if ([string](Get-OptionalProperty -InputObject $Init -PropertyName 'ResolvedEncodeLane' -Default '') -ne 'Nvidia') {
+    if ([string](Get-OptionalProperty -InputObject $Init -PropertyName 'ResolvedEncodeLane' -Default '') -notin @('Nvidia', 'Intel')) {
         $sp = Get-OptionalProperty -InputObject $Init -PropertyName 'SourceProfile' -Default $null
         $efficiency = ((Get-SvtAv1EfficiencyParamPairs -SourceProfile $sp -FrameRate ([double](Get-OptionalProperty -InputObject $sp -PropertyName 'FrameRate' -Default 0.0))) -join ':')
     }
@@ -8156,6 +8424,7 @@ function Get-EncodeInitialization {
         [string]$TargetGiBPerHourOverrideValue = ''
     )
 
+    if ($EncodeMode -eq 'qsv') { $NvencEnvironment = $script:QsvEnvironment }
     # A per-job override beats the global setting. Empty means "no override",
     # which is distinct from "0" -- 0 is a real, explicitly-pinned value that
     # the Balanced tier uses to mean "no bias, and do not defer to the global".
@@ -8199,6 +8468,22 @@ function Get-EncodeInitialization {
         -SourceProfile $sourceProfile `
         -EncodeMode $EncodeMode
 
+    if ($EncodeMode -eq 'qsv') {
+        # Per-job clone: another worker must never inherit this file's decoder.
+        $NvencEnvironment = @{} + $script:QsvEnvironment
+        $NvencEnvironment.DecodePlan = Resolve-QsvDecodePlan -InputPath $InputPath -Selected $selected -HdrPlan $hdrPlan -Environment $NvencEnvironment
+        Write-SessionTextLogMessage -Level Info -Message ("Intel decode | {0} | {1}" -f $NvencEnvironment.DecodePlan.DecodePath, $NvencEnvironment.DecodePlan.DecodeReason)
+    }
+    if ($EncodeMode -eq 'qsv' -and $hdrPlan.IsHdr -and $PreserveHdrStaticMetadata -and
+        $hdrPlan.StaticMetadata -and ($hdrPlan.StaticMetadata.HasMasteringDisplay -or $hdrPlan.StaticMetadata.HasContentLight) -and
+        -not $hdrPlan.CarryStaticMetadata) {
+        return [ordered]@{ EarlyExit = 'PRECHECK_SKIPPED_QSV_HDR'; Row = @{
+            Timestamp = (Get-Date).ToString('s'); Status = 'PRECHECK_SKIPPED_QSV_HDR'
+            InputPath = $InputPath; OutputPath = ''; EncodeMode = 'qsv'; ResolvedEncodeLane = 'Intel'
+            LaneSelectionReason = 'Intel lane cannot preserve static HDR metadata with this FFmpeg build; use CPU.'
+            Notes = $hdrPlan.RequiresCpuLaneReason
+        } }
+    }
     $tempOutput  = Get-TempOutputPath  -InputPath $InputPath
     $finalOutput = Get-FinalOutputPath -InputPath $InputPath
     $displayOutputName = [System.IO.Path]::GetFileName($finalOutput)
@@ -8277,8 +8562,8 @@ function Get-EncodeInitialization {
                 GrainScore        = ""
                 WasAutoSkipped    = "False"
                 NvencWorkerCountAtStart = ""
-                NvencEngineCountDetected = if ($NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
-                NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+                NvencEngineCountDetected = if ($EncodeMode -eq 'nvenc' -and $NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+                NvencCapacitySource = if ($EncodeMode -eq 'nvenc' -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
                 DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
                 FilmGrainDisabledReason = ""
                 SourceHdrFormat   = $sourceProfile.SourceHdrFormat
@@ -8431,8 +8716,8 @@ function Get-EncodeInitialization {
                 GrainScore        = $autoSettings.GrainScore
                 WasAutoSkipped    = "True"
                 NvencWorkerCountAtStart = ""
-                NvencEngineCountDetected = if ($NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
-                NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+                NvencEngineCountDetected = if ($EncodeMode -eq 'nvenc' -and $NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+                NvencCapacitySource = if ($EncodeMode -eq 'nvenc' -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
                 DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
                 FilmGrainDisabledReason = ""
                 FfmpegPath        = $FfmpegPath
@@ -8465,7 +8750,7 @@ function Get-EncodeInitialization {
         QualitySecondMetricName = ''
         QualitySecondMetricValue = 0.0
     }
-    if ($EncodeMode -eq 'nvenc') {
+    if ($EncodeMode -in @('nvenc', 'qsv')) {
         if (-not $NvencEnvironment) {
             throw "NVENC initialization requested without a detected NVENC environment."
         }
@@ -8481,7 +8766,7 @@ function Get-EncodeInitialization {
 
         if ([int]$autoSettings.FilmGrain -gt 0) {
             $effectiveFilmGrain = 0
-            $filmGrainDisabledReason = 'FFmpeg av1_nvenc does not expose AV1 film grain synthesis in this build; FilmGrain was forced to 0.'
+            $filmGrainDisabledReason = "Hardware AV1 ($EncodeMode) film-grain synthesis is not enabled; FilmGrain was forced to 0."
         }
     }
 
@@ -8529,7 +8814,7 @@ function Get-EncodeInitialization {
 
     $preflightEstimate = $preflightWorkflow.FinalPreflight
     $effectiveFilmGrain = [int]$preflightWorkflow.FinalResolvedFilmGrain
-    if ($EncodeMode -eq 'nvenc' -and $preflightWorkflow.FinalNvencSettings) {
+    if ($EncodeMode -in @('nvenc', 'qsv') -and $preflightWorkflow.FinalNvencSettings) {
         $nvencSettings = $preflightWorkflow.FinalNvencSettings
     }
 
@@ -8624,8 +8909,8 @@ function Get-EncodeInitialization {
                     GrainScore        = $autoSettings.GrainScore
                     WasAutoSkipped    = "False"
                     NvencWorkerCountAtStart = ""
-                    NvencEngineCountDetected = if ($NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
-                    NvencCapacitySource = if ($NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
+                    NvencEngineCountDetected = if ($EncodeMode -eq 'nvenc' -and $NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
+                    NvencCapacitySource = if ($EncodeMode -eq 'nvenc' -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
                     DetectedGpuName   = if ($NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
                     FilmGrainDisabledReason = $filmGrainDisabledReason
                     FfmpegPath        = $FfmpegPath
@@ -8722,6 +9007,9 @@ function Resolve-JobEncoderPreference {
     switch ($override.Trim().ToLowerInvariant()) {
         'cpu'    { return 'CPU' }
         'nvidia' { return 'Nvidia' }
+        'intel' { return 'Intel' }
+        'qsv' { return 'Intel' }
+        'quicksync' { return 'Intel' }
         'auto'   { return 'Auto' }
         default  { return $EncoderPreference }
     }
@@ -8752,9 +9040,10 @@ function Test-QueueHasLanePreferenceConflict {
     return $false
 }
 
-function Resolve-EncoderLane {
+function Resolve-EncoderLaneForHardware {
     param(
         [string]$InputPath,
+        [string]$HardwareLane = 'Nvidia',
         [string]$EncoderPreferenceValue,
         [bool]$CpuLaneAvailable = $true,
         [bool]$NvidiaLaneAvailable = $false,
@@ -8785,7 +9074,7 @@ function Resolve-EncoderLane {
         }
     }
 
-    if ($EncoderPreferenceValue -eq 'Nvidia') {
+    if ($EncoderPreferenceValue -eq $HardwareLane) {
         if (-not $NvencEnvironment) {
             # Reachable now that a single drop can ask for the Nvidia lane on a
             # machine where the configured preference never probed for one.
@@ -8808,7 +9097,7 @@ function Resolve-EncoderLane {
         return [pscustomobject][ordered]@{
             Ready  = $true
             Reason = 'Encoder preference forced the Nvidia lane.'
-            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'nvenc' -NvencEnvironment $NvencEnvironment -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced Nvidia lane by encoder preference' -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue)
+            Init   = (Get-EncodeInitialization -InputPath $InputPath -EncodeMode $(if ($HardwareLane -eq 'Intel') { 'qsv' } else { 'nvenc' }) -NvencEnvironment $NvencEnvironment -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'forced Nvidia lane by encoder preference' -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue)
         }
     }
 
@@ -8846,10 +9135,11 @@ function Resolve-EncoderLane {
         Lane   = $laneSuitability.PreferredLane
         Reason = $laneSuitability.Reason
     }
+    if ($hint.Lane -eq 'Nvidia') { $hint.Lane = $HardwareLane }
     $preferredLane = $hint.Lane
-    $preferredLaneAvailable = if ($preferredLane -eq 'Nvidia') { $NvidiaLaneAvailable } else { $CpuLaneAvailable }
-    $alternateLane = if ($preferredLane -eq 'Nvidia') { 'CPU' } else { 'Nvidia' }
-    $alternateLaneAvailable = if ($alternateLane -eq 'Nvidia') { $NvidiaLaneAvailable } else { $CpuLaneAvailable }
+    $preferredLaneAvailable = if ($preferredLane -eq $HardwareLane) { $NvidiaLaneAvailable } else { $CpuLaneAvailable }
+    $alternateLane = if ($preferredLane -eq $HardwareLane) { 'CPU' } else { $HardwareLane }
+    $alternateLaneAvailable = if ($alternateLane -eq $HardwareLane) { $NvidiaLaneAvailable } else { $CpuLaneAvailable }
 
     if ($laneSuitability.Suitability -eq 'CpuOnly' -and -not $CpuLaneAvailable) {
         return [pscustomobject][ordered]@{
@@ -8876,7 +9166,7 @@ function Resolve-EncoderLane {
             }
         }
 
-        if ($alternateLane -eq 'Nvidia' -and -not $laneSuitability.NvidiaFallbackAllowed) {
+        if ($alternateLane -eq $HardwareLane -and -not $laneSuitability.NvidiaFallbackAllowed) {
             return [pscustomobject][ordered]@{
                 Ready                 = $false
                 Reason                = "CPU-only decision: Nvidia fallback disabled for this file. $($laneSuitability.CpuOnlyReason)."
@@ -8888,7 +9178,7 @@ function Resolve-EncoderLane {
             }
         }
 
-        $alternateMode = if ($alternateLane -eq 'Nvidia') { 'nvenc' } else { 'software' }
+        $alternateMode = if ($alternateLane -eq $HardwareLane) { $(if ($HardwareLane -eq 'Intel') { 'qsv' } else { 'nvenc' }) } else { 'software' }
         $alternateReason = "$($hint.Reason); preferred $preferredLane lane busy, evaluating $alternateLane lane to keep workers active"
         $alternateInit = Get-EncodeInitialization `
             -InputPath $InputPath `
@@ -8902,7 +9192,7 @@ function Resolve-EncoderLane {
             -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue `
         -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue
 
-        if ($alternateLane -eq 'Nvidia') {
+        if ($alternateLane -eq $HardwareLane) {
             $nvencFallback = Test-NvencFallbackSuitable -LaneSuitability $laneSuitability -Init $alternateInit
             if (-not $nvencFallback.Allowed) {
                 return [pscustomobject][ordered]@{
@@ -8952,7 +9242,7 @@ function Resolve-EncoderLane {
         }
     }
 
-    $firstMode = if ($preferredLane -eq 'Nvidia') { 'nvenc' } else { 'software' }
+    $firstMode = if ($preferredLane -eq $HardwareLane) { $(if ($HardwareLane -eq 'Intel') { 'qsv' } else { 'nvenc' }) } else { 'software' }
     $firstInit = Get-EncodeInitialization `
         -InputPath $InputPath `
         -EncodeMode $firstMode `
@@ -9037,7 +9327,7 @@ function Resolve-EncoderLane {
         }
     }
 
-    $alternateMode = if ($alternateLane -eq 'Nvidia') { 'nvenc' } else { 'software' }
+    $alternateMode = if ($alternateLane -eq $HardwareLane) { $(if ($HardwareLane -eq 'Intel') { 'qsv' } else { 'nvenc' }) } else { 'software' }
     $alternateReason = "preferred $preferredLane lane preflight was unfavorable; trying $alternateLane lane"
     $alternateInit = Get-EncodeInitialization `
         -InputPath $InputPath `
@@ -9074,7 +9364,7 @@ function Resolve-EncoderLane {
         }
     }
 
-    if ($alternateLane -eq 'Nvidia') {
+    if ($alternateLane -eq $HardwareLane) {
         $nvencFallback = Test-NvencFallbackSuitable -LaneSuitability $laneSuitability -Init $alternateInit
         if (-not $nvencFallback.Allowed) {
             return & $consumeFirstSkip ("$($hint.Reason); CPU preflight was unfavorable and the Nvidia lane is not suitable for this source ($($nvencFallback.Reason))")
@@ -9082,7 +9372,7 @@ function Resolve-EncoderLane {
     }
 
     if ($alternateInit.EarlyExit -like 'PRECHECK_SKIPPED*') {
-        if ($alternateLane -eq 'Nvidia') {
+        if ($alternateLane -eq $HardwareLane) {
             return & $consumeFirstSkip ("$alternateReason; Nvidia preflight was also unfavorable; both lanes were unfavorable")
         }
 
@@ -9091,7 +9381,7 @@ function Resolve-EncoderLane {
 
     return [pscustomobject][ordered]@{
         Ready                 = $true
-        Reason                = $alternateInit.Row.LaneSelectionReason
+        Reason                = if ($alternateInit.EarlyExit) { $alternateInit.Row.LaneSelectionReason } else { $alternateInit.LaneSelectionReason }
         Init                  = $alternateInit
         HeldForCpuLane        = $false
         LaneSuitability       = $laneSuitability.Suitability
@@ -9865,7 +10155,9 @@ function Start-LaneWorker {
         Remove-Item -LiteralPath $Init.TempOutput -Force -ErrorAction SilentlyContinue
     }
 
-    $ffArgs = if ($Init.ResolvedEncodeLane -eq 'Nvidia') {
+    $ffArgs = if ($Init.ResolvedEncodeLane -eq 'Intel') {
+        Build-QsvFfmpegArgs -Init $Init -NvencEnvironment $script:QsvEnvironment
+    } elseif ($Init.ResolvedEncodeLane -eq 'Nvidia') {
         Build-NvencFfmpegArgs -Init $Init -NvencEnvironment $NvencEnvironment
     } else {
         Build-SoftwareFfmpegArgs -Init $Init
@@ -9951,13 +10243,14 @@ function Write-LaneProgressUI {
 
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($topBorder)
-    $lines.Add((Row "Encoder preference: $($Summary.EncoderPreference)  |  CPU active: $($Summary.CpuActive)/$CpuMaxParallel  |  Nvidia active: $($Summary.NvidiaActive)/$($Summary.NvidiaCapacity)" $cMeta))
+    $lines.Add((Row "Encoder preference: $($Summary.EncoderPreference)  |  CPU active: $($Summary.CpuActive)/$CpuMaxParallel  |  Nvidia active: $($Summary.NvidiaActive)/$($Summary.NvidiaCapacity)  |  Intel active: $($Summary.IntelActive)/$($Summary.IntelCapacity)" $cMeta))
     $lines.Add((Row (Get-QueueControlStateText) $cMeta))
     if ($NvencEnvironment) {
         $lines.Add((Row "GPU: $($NvencEnvironment.GpuName)  |  NVENC engines: $($NvencEnvironment.NvencEngineCount)  |  Nvidia capacity: $($NvencEnvironment.MaxParallel) ($($NvencEnvironment.CapacitySource))" $cMeta))
     } else {
         $lines.Add((Row 'GPU: unavailable  |  Nvidia lane disabled for this session' $cMeta))
     }
+    if ($script:QsvEnvironment) { $lines.Add((Row "GPU: $($script:QsvEnvironment.GpuName) | QSV AV1 10-bit | Intel capacity: $($Summary.IntelCapacity)" $cMeta)) }
     $lines.Add((Row "Pending: $($Summary.Pending)  |  Active: $($Summary.Active)  |  Completed: $($Summary.Completed)  |  Skipped: $($Summary.Skipped)  |  Failed: $($Summary.Failed)" $cQueue))
 
     foreach ($worker in @($Workers | Sort-Object SlotNumber)) {
@@ -9979,7 +10272,9 @@ function Write-LaneProgressUI {
         $empty = $barInner - $filled
         $pctLabel = ("{0,5:F1}%" -f $pct)
         $bar = "[${cBarDone}$([string][char]0x2588 * $filled)${reset}${cBarTodo}$([string][char]0x2591 * $empty)${reset}] ${cPct}$pctLabel${reset}"
-        $laneLabel = if ($worker.Init.ResolvedEncodeLane -eq 'Nvidia') {
+        $laneLabel = if ($worker.Init.ResolvedEncodeLane -eq 'Intel') {
+            "Lane Intel | Mode QSV | $($worker.Init.SourceProfile.Profile) | ICQ $($worker.Init.NvencSettings.CQ) | Preset $($worker.Init.NvencSettings.Preset) | Decode $($worker.Init.NvencSettings.DecodePath)"
+        } elseif ($worker.Init.ResolvedEncodeLane -eq 'Nvidia') {
             "Lane Nvidia  |  Mode NVENC  |  $($worker.Init.SourceProfile.Profile)  |  CQ $($worker.Init.NvencSettings.CQ)  |  Preset $($worker.Init.NvencSettings.Preset)"
         } else {
             "Lane CPU  |  Mode SVT-AV1  |  $($worker.Init.SourceProfile.Profile)  |  CRF $($worker.Init.PreflightWorkflow.FinalResolvedCRF)  |  Preset $($worker.Init.PreflightWorkflow.FinalResolvedPreset)  |  FilmGrain $($worker.Init.EffectiveFilmGrain)"
@@ -10049,6 +10344,7 @@ function Complete-LaneWorker {
     Stop-TrackedFfmpegProcess -TrackedProcess $tracked
     $liveEstimate = Update-LiveEstimateState -State $tracked.Shared -SourceDurationSec $init.SourceDurationSec -SourceSizeBytes $init.SourceItem.Length
     $isNvenc = ($init.ResolvedEncodeLane -eq 'Nvidia')
+    $isQsv = ($init.ResolvedEncodeLane -eq 'Intel')
 
     $hdrPlan = Get-OptionalProperty -InputObject $init -PropertyName 'HdrPlan' -Default $null
     $hdrLogFields = Get-HdrLogFields -Init $init
@@ -10060,8 +10356,8 @@ function Complete-LaneWorker {
     if ($init.CpuOnlyReason) { $notesList.Add($init.CpuOnlyReason) }
     if ($init.PreflightEstimate.Ran) { $notesList.Add($init.PreflightEstimate.Reason) }
     if ($init.FilmGrainDisabledReason) { $notesList.Add($init.FilmGrainDisabledReason) }
-    if ($isNvenc -and $init.NvencSettings.Reason) { $notesList.Add($init.NvencSettings.Reason) }
-    if ($isNvenc -and $init.NvencSettings.TuneReason) { $notesList.Add($init.NvencSettings.TuneReason) }
+    if (($isNvenc -or $isQsv) -and $init.NvencSettings.Reason) { $notesList.Add($init.NvencSettings.Reason) }
+    if (($isNvenc -or $isQsv) -and $init.NvencSettings.TuneReason) { $notesList.Add($init.NvencSettings.TuneReason) }
     if ($tracked.WorkerPriorityReason) { $notesList.Add($tracked.WorkerPriorityReason) }
     if ($null -ne $hdrPlan) {
         foreach ($hdrNote in $hdrPlan.Notes) { $notesList.Add($hdrNote) }
@@ -10125,10 +10421,12 @@ function Complete-LaneWorker {
             ResolvedCRF       = $init.PreflightWorkflow.FinalResolvedCRF
             ResolvedPreset    = $init.PreflightWorkflow.FinalResolvedPreset
             ResolvedFilmGrain = $init.EffectiveFilmGrain
-            ResolvedCQ        = if ($isNvenc) { $init.NvencSettings.CQ } else { "" }
+            QsvICQ            = if ($isQsv) { $init.NvencSettings.CQ } else { '' }
+            QsvPreset         = if ($isQsv) { $init.NvencSettings.Preset } else { '' }
+            ResolvedCQ        = if ($isNvenc -or $isQsv) { $init.NvencSettings.CQ } else { "" }
             ResolvedNvencPreset = if ($isNvenc) { $init.NvencSettings.Preset } else { "" }
             ResolvedNvencTune = if ($isNvenc) { $init.NvencSettings.Tune } else { "" }
-            ResolvedDecodePath = if ($isNvenc) { $init.NvencSettings.DecodePath } else { "" }
+            ResolvedDecodePath = if ($isNvenc -or $isQsv) { $init.NvencSettings.DecodePath } else { "" }
             AutoReason        = if (-not [string]::IsNullOrWhiteSpace($init.PreflightWorkflow.PreflightAutoTuneReason)) { $init.PreflightWorkflow.PreflightAutoTuneReason } else { $init.AutoSettings.Reason }
             BPP               = [Math]::Round($init.AutoSettings.BPP, 6)
             EffectiveVideoBitrate = $init.AutoSettings.VideoBitrate
@@ -10141,7 +10439,7 @@ function Complete-LaneWorker {
             NvencWorkerCountAtStart = if ($isNvenc) { $Worker.NvencWorkerCountAtStart } else { "" }
             NvencEngineCountDetected = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
             NvencCapacitySource = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
-            DetectedGpuName   = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+            DetectedGpuName   = if ($isQsv) { $script:QsvEnvironment.GpuName } elseif ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
             FilmGrainDisabledReason = $init.FilmGrainDisabledReason
             SourceHdrFormat   = $hdrLogFields.SourceHdrFormat
             HdrTargetFormat   = $hdrLogFields.HdrTargetFormat
@@ -10294,10 +10592,12 @@ function Complete-LaneWorker {
         ResolvedCRF       = $init.PreflightWorkflow.FinalResolvedCRF
         ResolvedPreset    = $init.PreflightWorkflow.FinalResolvedPreset
         ResolvedFilmGrain = $init.EffectiveFilmGrain
-        ResolvedCQ        = if ($isNvenc) { $init.NvencSettings.CQ } else { "" }
+        QsvICQ            = if ($isQsv) { $init.NvencSettings.CQ } else { '' }
+            QsvPreset         = if ($isQsv) { $init.NvencSettings.Preset } else { '' }
+            ResolvedCQ        = if ($isNvenc -or $isQsv) { $init.NvencSettings.CQ } else { "" }
         ResolvedNvencPreset = if ($isNvenc) { $init.NvencSettings.Preset } else { "" }
         ResolvedNvencTune = if ($isNvenc) { $init.NvencSettings.Tune } else { "" }
-        ResolvedDecodePath = if ($isNvenc) { $init.NvencSettings.DecodePath } else { "" }
+        ResolvedDecodePath = if ($isNvenc -or $isQsv) { $init.NvencSettings.DecodePath } else { "" }
         AutoReason        = if (-not [string]::IsNullOrWhiteSpace($init.PreflightWorkflow.PreflightAutoTuneReason)) { $init.PreflightWorkflow.PreflightAutoTuneReason } else { $init.AutoSettings.Reason }
         BPP               = [Math]::Round($init.AutoSettings.BPP, 6)
         EffectiveVideoBitrate = $init.AutoSettings.VideoBitrate
@@ -10310,7 +10610,7 @@ function Complete-LaneWorker {
         NvencWorkerCountAtStart = if ($isNvenc) { $Worker.NvencWorkerCountAtStart } else { "" }
         NvencEngineCountDetected = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.NvencEngineCount } else { "" }
         NvencCapacitySource = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.CapacitySource } else { "" }
-        DetectedGpuName   = if ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
+        DetectedGpuName   = if ($isQsv) { $script:QsvEnvironment.GpuName } elseif ($isNvenc -and $NvencEnvironment) { $NvencEnvironment.GpuName } else { "" }
         FilmGrainDisabledReason = $init.FilmGrainDisabledReason
         SourceHdrFormat   = $hdrLogFields.SourceHdrFormat
         HdrTargetFormat   = $hdrLogFields.HdrTargetFormat
@@ -10622,7 +10922,7 @@ function Invoke-AutoEncoderLaneQueueProcessing {
     $script:QueueStalled = $false
     $nvidiaCapacity = if ($NvencEnvironment) { [Math]::Max(1, $NvencEnvironment.MaxParallel) } else { 0 }
     $summary = [pscustomobject][ordered]@{
-        EncoderPreference = 'Auto'
+        EncoderPreference = $EncoderPreference
         Completed         = 0
         Skipped           = 0
         Failed            = 0
@@ -10631,6 +10931,8 @@ function Invoke-AutoEncoderLaneQueueProcessing {
         CpuActive         = 0
         NvidiaActive      = 0
         NvidiaCapacity    = $nvidiaCapacity
+        IntelActive       = 0
+        IntelCapacity     = if ($script:QsvEnvironment) { $script:QsvEnvironment.MaxParallel } else { 0 }
     }
 
     $activeWorkers = New-Object System.Collections.Generic.List[object]
@@ -10655,14 +10957,15 @@ function Invoke-AutoEncoderLaneQueueProcessing {
         while (-not $script:QueueShutdownRequested -and $pendingJobs.Count -gt 0) {
             $cpuAvailable = (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'CPU' }).Count -lt $CpuMaxParallel)
             $nvidiaAvailable = (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'Nvidia' }).Count -lt $nvidiaCapacity)
-            if (-not $cpuAvailable -and -not $nvidiaAvailable) { break }
+            $intelAvailable = ($script:QsvEnvironment -and (@($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'Intel' }).Count -lt $script:QsvEnvironment.MaxParallel))
+            if (-not $cpuAvailable -and -not $nvidiaAvailable -and -not $intelAvailable) { break }
 
             # Lane availability is the ONLY thing that can turn a held job into
             # a runnable one. Re-asking an unchanged question costs a full probe,
             # quality search and preflight per job per pass, so a job that was
             # held under this exact availability is skipped outright until a
             # worker starts or finishes.
-            $availabilitySignature = "cpu=$cpuAvailable|nvidia=$nvidiaAvailable"
+            $availabilitySignature = "cpu=$cpuAvailable|nvidia=$nvidiaAvailable|intel=$intelAvailable"
 
             $scheduledAny = $false
             $heldThisPass = 0
@@ -10690,13 +10993,13 @@ function Invoke-AutoEncoderLaneQueueProcessing {
                         -InputPath $job.InputPath `
                         -EncoderPreferenceValue $jobLanePreference `
                         -CpuLaneAvailable $cpuAvailable `
-                        -NvidiaLaneAvailable $nvidiaAvailable `
+                        -NvidiaLaneAvailable $nvidiaAvailable -IntelLaneAvailable $intelAvailable `
                         -NvencEnvironment $NvencEnvironment
 
                     if (-not $resolution.Ready) {
                         $script:LaneHoldSignatures[$nextJob.FullName] = $availabilitySignature
                         $heldThisPass++
-                        if ($resolution.HeldForCpuLane -and $job.InputPath) {
+                        if ((Get-OptionalProperty -InputObject $resolution -PropertyName 'HeldForCpuLane' -Default $false) -and $job.InputPath) {
                             if ($script:HeldForCpuAnnouncements.Add($job.InputPath)) {
                                 Write-Host $resolution.Reason -ForegroundColor DarkYellow
                                 Write-SessionTextLogMessage -Level Info -Message $resolution.Reason
@@ -10827,6 +11130,7 @@ function Invoke-AutoEncoderLaneQueueProcessing {
         $summary.Pending = @(Get-ChildItem -LiteralPath $QueuePendingDir -Filter *.json -File -ErrorAction SilentlyContinue).Count
         $summary.CpuActive = @($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'CPU' }).Count
         $summary.NvidiaActive = @($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'Nvidia' }).Count
+        $summary.IntelActive = @($activeWorkers | Where-Object { $_.Init.ResolvedEncodeLane -eq 'Intel' }).Count
         $summary.Active = $activeWorkers.Count
         if (-not $script:QueueShutdownRequested) {
             $uiLineCount = Write-LaneProgressUI -Workers $activeWorkers.ToArray() -Summary $summary -NvencEnvironment $NvencEnvironment -UICursorRow $uiLineCount
@@ -11964,6 +12268,10 @@ function Invoke-QueueProcessing {
     }
 
     switch ($script:QueueLoopPreference) {
+        'Intel' {
+            Invoke-AutoEncoderLaneQueueProcessing -NvencEnvironment $script:NvencEnvironment
+            return
+        }
         'Nvidia' {
             Invoke-NvencQueueProcessing -NvencEnvironment $script:NvencEnvironment
             return
@@ -12135,8 +12443,11 @@ if (-not [string]::IsNullOrWhiteSpace($EncoderPreferenceOverride)) {
     $EncoderPreferenceOverride = switch ($EncoderPreferenceOverride.Trim().ToLowerInvariant()) {
         'cpu'    { 'CPU' }
         'nvidia' { 'Nvidia' }
+        'intel' { 'Intel' }
+        'qsv' { 'Intel' }
+        'quicksync' { 'Intel' }
         'auto'   { 'Auto' }
-        default  { throw "EncoderPreferenceOverride must be Auto, CPU, or Nvidia (got '$EncoderPreferenceOverride')." }
+        default  { throw "EncoderPreferenceOverride must be Auto, CPU, Nvidia, or Intel (got '$EncoderPreferenceOverride')." }
     }
 }
 $SoftwareEncodePriority = Resolve-ProcessPriorityConfigValue -Name 'SoftwareEncodePriority' -Value $SoftwareEncodePriority
@@ -12144,6 +12455,13 @@ $HardwareEncodePriority = Resolve-ProcessPriorityConfigValue -Name 'HardwareEnco
 $ScriptProcessPriority = Resolve-ProcessPriorityConfigValue -Name 'ScriptProcessPriority' -Value $ScriptProcessPriority
 $ApplyProcessPriority = Resolve-BooleanConfigValue -Name 'ApplyProcessPriority' -Value $ApplyProcessPriority
 $NvencMaxParallel = Resolve-ConfigValue -Name 'NvencMaxParallel' -Value $NvencMaxParallel -Minimum 1 -Maximum 16
+$QsvMaxParallel = Resolve-ConfigValue -Name 'QsvMaxParallel' -Value $QsvMaxParallel -Minimum 1 -Maximum 8
+if ($QsvMaxParallel -eq 'Auto') { $QsvMaxParallel = 1 }
+$QsvICQ = Resolve-ConfigValue -Name 'QsvICQ' -Value $QsvICQ -Minimum 1 -Maximum 51
+if ($QsvPreset -notin @('veryfast','faster','fast','medium','slow','slower','veryslow')) { throw 'Invalid QsvPreset.' }
+$QsvPreset = $QsvPreset.ToLowerInvariant()
+if ($QsvDecode -notin @('Auto','cpu','qsv')) { throw 'QsvDecode must be Auto, cpu, or qsv.' }
+if ($QsvAdapter -ne 'Auto' -and [string]$QsvAdapter -notmatch '^\d+$') { throw 'QsvAdapter must be Auto or a non-negative DXGI adapter index.' }
 $NvencCQ = Resolve-ConfigValue -Name 'NvencCQ' -Value $NvencCQ -Minimum 0 -Maximum 63
 $NvencPreset = Resolve-NvencPresetConfigValue -Name 'NvencPreset' -Value $NvencPreset
 $NvencDecode = Resolve-NvencDecodeConfigValue -Name 'NvencDecode' -Value $NvencDecode
@@ -12419,6 +12737,12 @@ if ($route -like 'NONE*') {
 }
 
 # ---------------------------------------------------------------------------
+Write-Head "Intel Quick Sync (AV1)"
+try {
+    $qsv = Get-QsvEnvironment
+    Write-Item 'av1_qsv' 'hardware test passed' 'ok' $qsv.ProbeDetail
+} catch { Write-Item 'av1_qsv' 'unavailable' 'info' $_.Exception.Message }
+
 Write-Head "NVENC (AV1)"
 
 $nvHelp = ''
@@ -13356,9 +13680,25 @@ Write-Host 'These are predictions. The preflight and quality search still decide
 Write-Host 'and can still refuse a file this list likes -- that is them working correctly.' -ForegroundColor DarkGray
 
 if (-not [string]::IsNullOrWhiteSpace($Csv)) {
-    $sorted | Export-Csv -LiteralPath $Csv -NoTypeInformation -Encoding UTF8
+    # Summary covers all exported candidates; rates are recomputed, not summed.
+    $summary = [ordered]@{}
+    foreach ($property in $sorted[0].PSObject.Properties.Name) { $summary[$property] = '' }
+    $summary['Name'] = ('TOTAL ({0} candidates)' -f $rows.Count)
+    $sourceTotal = [double]($sorted | Measure-Object -Property SourceGiB -Sum).Sum
+    $summary['SourceGiB'] = [Math]::Round($sourceTotal, 3)
+    $summary['DurationMin'] = [Math]::Round([double]($sorted | Measure-Object -Property DurationMin -Sum).Sum, 1)
+    $summary['ExpectedSavedGiB'] = [Math]::Round($totalSaved, 3)
+    $summary['EncodeHours'] = [Math]::Round($totalHours, 2)
+    if ($sourceTotal -gt 0) {
+        $summary['ExpectedSavingPct'] = [Math]::Round(100.0 * $totalSaved / $sourceTotal, 1)
+    }
+    if ($totalHours -gt 0) {
+        $summary['PayoffGiBPerHour'] = [Math]::Round($totalSaved / $totalHours, 3)
+    }
+    # Path stays blank so the summary is not treated as a media file.
+    @([pscustomobject]$summary; $sorted) | Export-Csv -LiteralPath $Csv -NoTypeInformation -Encoding UTF8
     Write-Host ''
-    Write-Host ("Full results: {0}" -f $Csv) -ForegroundColor Green
+    Write-Host ("Full results (totals in first data row): {0}" -f $Csv) -ForegroundColor Green
 }
 
 if (-not [string]::IsNullOrWhiteSpace($OutList)) {
@@ -16335,6 +16675,12 @@ if ($laneOverrideInPlay -and $EncoderPreference -ne 'Auto') {
     Write-Host ("Encoder preference is '{0}', but a queued drop asked for a different lane. Using the automatic lane scheduler so both are honoured." -f $EncoderPreference) -ForegroundColor DarkCyan
 }
 
+$script:QsvEnvironment = $null
+if ($script:QueueLoopPreference -eq 'Intel') {
+    $script:QsvEnvironment = Get-QsvEnvironment
+} elseif ($script:QueueLoopPreference -eq 'Auto') {
+    $script:QsvEnvironment = Try-Get-QsvEnvironment
+}
 $script:NvencEnvironment = $null
 if ($script:QueueLoopPreference -eq 'Nvidia') {
     $script:NvencEnvironment = Get-NvencEnvironment
@@ -16342,7 +16688,7 @@ if ($script:QueueLoopPreference -eq 'Nvidia') {
     if ($startupTuneResolution.Warning) {
         Write-Warning $startupTuneResolution.Warning
     }
-} elseif ($script:QueueLoopPreference -eq 'Auto') {
+} elseif ($script:QueueLoopPreference -eq 'Auto' -and -not (Test-IntelOnlyPendingQueue)) {
     $script:NvencEnvironment = Try-Get-NvencEnvironment
     if ($script:NvencEnvironment) {
         $startupTuneResolution = Resolve-NvencTune -ConfiguredNvencTune $NvencTune -NvencEnvironment $script:NvencEnvironment
@@ -16790,11 +17136,12 @@ function Invoke-InteractiveMenuAction {
 
     Write-Host ''
     Write-Host 'Which encoder?'
-    Write-Host '  [1] Auto    pick per file, keeps both busy'
+    Write-Host '  [1] Auto    pick per file, uses available lanes'
     Write-Host '  [2] CPU     SVT-AV1. Best compression, slower'
     Write-Host '  [3] NVENC   GPU. Much faster, larger files at similar quality'
-    $lane = Read-MenuChoice -Prompt 'Choose 1-3' -Valid @('1','2','3') -Default '1'
-    $laneOverride = switch ($lane) { '1' { '' } '2' { 'CPU' } '3' { 'Nvidia' } }
+    Write-Host '  [4] Intel   Quick Sync AV1 (supported Intel GPU required)'
+    $lane = Read-MenuChoice -Prompt 'Choose 1-4' -Valid @('1','2','3','4') -Default '1'
+    $laneOverride = switch ($lane) { '1' { '' } '2' { 'CPU' } '3' { 'Nvidia' } '4' { 'Intel' } }
 
     if ($ReplaceOriginal) {
         Write-Host ''
@@ -16954,3 +17301,5 @@ if ($Mode) {
     }
     Show-MainMenu
 }
+
+
