@@ -221,7 +221,7 @@ $SubtitleCompatibilityMode = 'Convert' # Subtitles Matroska cannot carry (mov_te
 $KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track when the main track is lossless.
 
 # Candidates: number shown and included in the queue shortlist. CSV always includes all candidates.
-$CandidatesTop = 40             # Positive integer, for example 1000. 0 = all eligible candidates.
+$CandidatesTop = 50             # Positive integer, for example 1000. 0 = all eligible candidates.
 
 # =============================================================================
 # Notes
@@ -9657,6 +9657,25 @@ function Get-QueueConsoleFrame {
     return [pscustomobject]@{ Text = $sb.ToString(); LineCount = $visibleLines.Count }
 }
 
+function Start-QueueConsoleScreen {
+    if ([Console]::IsOutputRedirected -or -not $Host.UI.SupportsVirtualTerminal) { return }
+    $active = Get-Variable -Name QueueConsoleScreenActive -Scope Script -ErrorAction SilentlyContinue
+    if ($active -and $active.Value) { return }
+    # Keep transient dashboard rows out of the normal terminal's scrollback.
+    # Set the flag first so session cleanup can restore even after a write error.
+    $script:QueueConsoleScreenActive = $true
+    $esc = [char]27
+    [Console]::Write("${esc}[?1049h${esc}[2J${esc}[H")
+}
+
+function Stop-QueueConsoleScreen {
+    $active = Get-Variable -Name QueueConsoleScreenActive -Scope Script -ErrorAction SilentlyContinue
+    if (-not $active -or -not $active.Value) { return }
+    $esc = [char]27
+    try { [Console]::Write("${esc}[0m${esc}[?1049l") }
+    finally { $script:QueueConsoleScreenActive = $false }
+}
+
 function Write-QueueConsoleFrame {
     param([string[]]$Lines)
     if ([Console]::IsOutputRedirected -or -not $Host.UI.SupportsVirtualTerminal) {
@@ -9670,6 +9689,7 @@ function Write-QueueConsoleFrame {
     }
     $size = $Host.UI.RawUI.WindowSize
     if ($size.Width -lt 2 -or $size.Height -lt 2) { return 0 }
+    Start-QueueConsoleScreen
     $frame = Get-QueueConsoleFrame -Lines $Lines -Width $size.Width -Height $size.Height
     [Console]::Write($frame.Text)
     return $frame.LineCount
@@ -16904,6 +16924,7 @@ try {
 
     try {
         Invoke-QueueProcessing
+        Stop-QueueConsoleScreen
         Write-SessionSummary
     } catch {
         $message = $_.Exception.Message
@@ -16921,6 +16942,7 @@ try {
     }
 }
 finally {
+    Stop-QueueConsoleScreen
     Restore-ConsoleShutdownHandling
     if ($hasLock) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()
