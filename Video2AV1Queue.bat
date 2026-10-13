@@ -6,12 +6,12 @@ REM   Drag video files or folders onto this file  ->  they get encoded
 REM   Double-click it with nothing selected       ->  a menu opens
 REM
 REM There is only one script. Everything -- encoding, the diagnostics, the
-REM library scans, the loudness tools -- lives in Video2AV1Queue.ConsoleFix.ps1 and is
+REM library scans, the loudness tools -- lives in Video2AV1Queue.ps1 and is
 REM reachable from the menu.
 REM ===========================================================================
 setlocal
 set "SCRIPT_DIR=%~dp0"
-set "PS1=%SCRIPT_DIR%Video2AV1Queue.ConsoleFix.ps1"
+set "PS1=%SCRIPT_DIR%Video2AV1Queue.ps1"
 
 where pwsh >nul 2>nul
 if errorlevel 1 (
@@ -25,7 +25,7 @@ if errorlevel 1 (
 
 if not exist "%PS1%" (
     echo.
-    echo Could not find Video2AV1Queue.ConsoleFix.ps1 next to this file:
+    echo Could not find Video2AV1Queue.ps1 next to this file:
     echo   %PS1%
     echo.
     pause
