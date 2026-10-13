@@ -8,9 +8,9 @@
 **Convert common video files to AV1 and make the files smaller without losing anything you can see.**  
 [View supported containers and codecs →](SUPPORTED-FORMATS.md)
 
-That is the whole goal, and the thing that makes this different from other tools - Most tools answer *"how big will this be?"* with a bitrate heuristic. This one encodes short samples, **measures** them against the source with VMAF or XPSNR, and searches for the highest CRF that still looks the same — then hands that to the size projection, which keeps its veto.
+That is the whole goal, and the thing that makes this different from a batch script is the second half of it. Most tools answer *"how big will this be?"* with a bitrate heuristic. This one encodes short samples, **measures** them against the source with VMAF or XPSNR, and searches for the highest CRF that still looks the same — then hands that to the size projection, which keeps its veto.
 
-One PowerShell file and a launcher. Drag files on to the .bat file; double-click for a menu.
+One PowerShell file and a launcher. Drag files on to encode; double-click for a menu.
 
 ---
 
