@@ -54,6 +54,8 @@ Video2AV1Queue.bat      drag files onto this, or double-click it
 Video2AV1Queue.ps1      everything: encoder, tools, settings
 ffmpeg.exe              (or on PATH)
 ffprobe.exe
+dovi_tool.exe
+hdr10plus_tool.exe
 ```
 
 | | |
