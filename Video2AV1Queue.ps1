@@ -220,6 +220,9 @@ $KeepEnglishSDH = $false          # Keep an English SDH subtitle track in additi
 $SubtitleCompatibilityMode = 'Convert' # Subtitles Matroska cannot carry (mov_text from MP4, etc). Convert | Drop | Skip.
 $KeepEnglishFallbackAudio = $true # Keep a secondary lossy English audio track when the main track is lossless.
 
+# Candidates: number shown and included in the queue shortlist. CSV always includes all candidates.
+$CandidatesTop = 40             # Positive integer, for example 1000. 0 = all eligible candidates.
+
 # =============================================================================
 # Notes
 # =============================================================================
@@ -13093,7 +13096,8 @@ param(
     [string[]]$Path,
 
     # How many candidates to print. The CSV always contains everything.
-    [int]$Top = 40,
+    [ValidateRange(0, 2147483647)]
+    [int]$Top = $CandidatesTop,
 
     # Payoff  = expected GiB returned per hour of encoding  (default)
     # Saved   = expected GiB returned, ignoring how long it takes
@@ -13659,7 +13663,7 @@ $sorted = switch ($SortBy) {
 # =============================================================================
 $totalSaved = ($rows | Measure-Object -Property ExpectedSavedGiB -Sum).Sum
 $totalHours = ($rows | Measure-Object -Property EncodeHours -Sum).Sum
-$topN = @($sorted | Select-Object -First $Top)
+$topN = if ($Top -eq 0) { @($sorted) } else { @($sorted | Select-Object -First $Top) }
 $topSaved = ($topN | Measure-Object -Property ExpectedSavedGiB -Sum).Sum
 $topHours = ($topN | Measure-Object -Property EncodeHours -Sum).Sum
 
@@ -17111,7 +17115,8 @@ function Invoke-CandidatesMenuAction {
 
     Write-Host 'Estimate encoding time for which lane? CPU, Nvidia, or Intel (one worker; not mixed Auto scheduling).'
     $lane = Read-MenuChoice -Prompt 'Estimate lane (Enter = CPU)' -Valid @('CPU','Nvidia','Intel') -Default 'CPU'
-    Invoke-CandidatesTool -Path $paths -Csv $csv -OutList $list -Lane $lane
+    Write-Host ("Shortlist limit: {0} (edit CandidatesTop near the top of the script)." -f $(if ($CandidatesTop -eq 0) { 'all eligible candidates' } else { $CandidatesTop })) -ForegroundColor DarkGray
+    Invoke-CandidatesTool -Path $paths -Csv $csv -OutList $list -Lane $lane -Top $CandidatesTop
 
     Write-Host ''
     if ((Test-Path -LiteralPath $list) -and (Read-Confirmation -Prompt 'Queue the shortlist for encoding now?')) {
