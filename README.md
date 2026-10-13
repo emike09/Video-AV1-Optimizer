@@ -260,3 +260,9 @@ Pull requests welcome. Ideas: an AMD lane, Linux support, broader quality-thresh
 ## ⭐ Support
 
 If this helped you, give it a star.
+
+---
+
+## Disclaimer
+
+These tools can destructively alter your library. Ensure you have a full backup before attempting an entire library conversion. It is highly recommended to test on a handful of files first before applying to your library. The '$ReplaceOriginal = $true' flag in the Video2AV1Queue.ps1 file (line 210) will replace your original files. Set the flat to =$false if you do not want your original files replaced. I am not responsible for irreversible changes to your files. 
