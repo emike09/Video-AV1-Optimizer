@@ -532,21 +532,130 @@ $MutexName = "Global\PlexAV1QueueMutex"
 # =============================================================================
 # Tool discovery
 # Prefers ffmpeg / ffprobe placed next to the script (portable deployment),
-# then falls back to whatever is on PATH.
+# then falls back to whatever is on PATH.  If neither location works, asks the
+# user to supply the path interactively and (optionally) adds it to the user's
+# PATH so the prompt never fires again.
 # =============================================================================
 $FfmpegPath  = Join-Path $PSScriptRoot "ffmpeg.exe"
 $FfprobePath = Join-Path $PSScriptRoot "ffprobe.exe"
 
 if (-not (Test-Path -LiteralPath $FfmpegPath)) {
     $ffmpegCmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
-    if (-not $ffmpegCmd) { throw "ffmpeg.exe not found next to script or in PATH." }
-    $FfmpegPath = $ffmpegCmd.Source
+    if ($ffmpegCmd) {
+        $FfmpegPath = $ffmpegCmd.Source
+    } else {
+        # ---- interactive fallback ----
+        Write-Host ""
+        Write-Host "================================================================" -ForegroundColor Yellow
+        Write-Host " ffmpeg.exe was not found next to this script or in PATH." -ForegroundColor Yellow
+        Write-Host "================================================================" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Download a full FFmpeg build from:" -ForegroundColor White
+        Write-Host "  https://www.gyan.dev/ffmpeg/builds/  (gyan.dev 'full' build)" -ForegroundColor Cyan
+        Write-Host "  https://github.com/BtbN/FFmpeg-Builds/releases  (BtbN 'gpl' build)" -ForegroundColor Cyan
+        Write-Host ""
+
+        $resolvedFfmpegDir = $null
+        while ($null -eq $resolvedFfmpegDir) {
+            Write-Host "Enter the full path to ffmpeg.exe, or the folder that contains it:" -ForegroundColor White
+            $rawInput = Read-Host "Path"
+            $rawInput = $rawInput.Trim().Trim('"').Trim("'")
+
+            if ([string]::IsNullOrWhiteSpace($rawInput)) {
+                Write-Host "No path entered. Please try again." -ForegroundColor Yellow
+                continue
+            }
+
+            # Accept either the exe itself or its containing folder
+            $candidate = $rawInput
+            if ([System.IO.Path]::GetFileName($candidate) -eq 'ffmpeg.exe') {
+                $candidate = [System.IO.Path]::GetDirectoryName($candidate)
+            }
+
+            $testFfmpeg  = Join-Path $candidate "ffmpeg.exe"
+            $testFfprobe = Join-Path $candidate "ffprobe.exe"
+
+            if (-not (Test-Path -LiteralPath $testFfmpeg)) {
+                Write-Host "ffmpeg.exe not found in: $candidate" -ForegroundColor Red
+                Write-Host "Please check the path and try again." -ForegroundColor Yellow
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $testFfprobe)) {
+                Write-Host "ffmpeg.exe was found but ffprobe.exe was not in the same folder." -ForegroundColor Red
+                Write-Host "Both executables must be in the same directory. Please try again." -ForegroundColor Yellow
+                continue
+            }
+
+            $resolvedFfmpegDir = $candidate
+        }
+
+        $FfmpegPath  = Join-Path $resolvedFfmpegDir "ffmpeg.exe"
+        $FfprobePath = Join-Path $resolvedFfmpegDir "ffprobe.exe"
+
+        Write-Host ""
+        Write-Host "Found ffmpeg and ffprobe in: $resolvedFfmpegDir" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Would you like to add this folder to your user PATH so it is found automatically next time?" -ForegroundColor White
+        Write-Host "  [Y] Yes - add to user PATH (does NOT require admin rights)" -ForegroundColor White
+        Write-Host "  [N] No  - use this path for this session only" -ForegroundColor White
+        Write-Host ""
+
+        $addToPath = $null
+        while ($null -eq $addToPath) {
+            $pathResponse = (Read-Host "Add to user PATH? [Y/N] (default N)").Trim().ToUpperInvariant()
+            if ([string]::IsNullOrWhiteSpace($pathResponse) -or $pathResponse -eq 'N') {
+                $addToPath = $false
+            } elseif ($pathResponse -eq 'Y') {
+                $addToPath = $true
+            } else {
+                Write-Host "Please enter Y or N." -ForegroundColor Yellow
+            }
+        }
+
+        if ($addToPath) {
+            try {
+                $regKey  = 'HKCU:\Environment'
+                $current = (Get-ItemProperty -Path $regKey -Name Path -ErrorAction SilentlyContinue).Path
+                if ([string]::IsNullOrWhiteSpace($current)) {
+                    $newPath = $resolvedFfmpegDir
+                } else {
+                    # Only add if not already present (case-insensitive)
+                    $existing = $current -split ';' | Where-Object { $_ -ne '' }
+                    if ($existing | Where-Object { $_.TrimEnd('\') -ieq $resolvedFfmpegDir.TrimEnd('\') }) {
+                        Write-Host "Folder is already in your user PATH." -ForegroundColor DarkGray
+                        $newPath = $null
+                    } else {
+                        $newPath = ($existing + $resolvedFfmpegDir) -join ';'
+                    }
+                }
+
+                if ($null -ne $newPath) {
+                    Set-ItemProperty -Path $regKey -Name Path -Value $newPath -Type ExpandString
+                    # Refresh PATH for this session so Get-Command would find it now
+                    $env:PATH = ($env:PATH.TrimEnd(';') + ';' + $resolvedFfmpegDir)
+                    Write-Host "User PATH updated. New sessions will find ffmpeg automatically." -ForegroundColor Green
+                }
+            } catch {
+                Write-Warning "Could not update user PATH: $($_.Exception.Message)"
+                Write-Warning "You can add '$resolvedFfmpegDir' to your PATH manually via System Properties."
+            }
+        }
+
+        Write-Host ""
+    }
 }
 
+# Resolve ffprobe from the same directory as ffmpeg when ffmpeg was found on
+# PATH or via interactive prompt (FfprobePath may still point to script dir).
 if (-not (Test-Path -LiteralPath $FfprobePath)) {
-    $ffprobeCmd = Get-Command ffprobe -ErrorAction SilentlyContinue
-    if (-not $ffprobeCmd) { throw "ffprobe.exe not found next to script or in PATH." }
-    $FfprobePath = $ffprobeCmd.Source
+    $ffprobeInSameDir = Join-Path ([System.IO.Path]::GetDirectoryName($FfmpegPath)) "ffprobe.exe"
+    if (Test-Path -LiteralPath $ffprobeInSameDir) {
+        $FfprobePath = $ffprobeInSameDir
+    } else {
+        $ffprobeCmd = Get-Command ffprobe -ErrorAction SilentlyContinue
+        if (-not $ffprobeCmd) { throw "ffprobe.exe not found next to ffmpeg.exe, next to this script, or in PATH." }
+        $FfprobePath = $ffprobeCmd.Source
+    }
 }
 
 # =============================================================================
@@ -16845,5 +16954,3 @@ if ($Mode) {
     }
     Show-MainMenu
 }
-
-
