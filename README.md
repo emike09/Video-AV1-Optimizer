@@ -41,7 +41,7 @@ One PowerShell file and a launcher. Drag files on to Video2AV1Queue.bat; or doub
 
 Most full builds — gyan.dev "full", BtbN "gpl" — have everything needed. FFmpeg 8.x runs with **reduced capability** and says so; 6.x / 7.x and "essentials" builds are not supported. The **Doctor** tool tells you exactly what your build can do.
 
-Two optional binaries unlock HDR10+ preservation and richer Dolby Vision logging — dovi_tool.exe and hdr10plus_tool.exe. These are bundled in the release, but feel free to obtain them yourself if needed.
+The release bundles hdr10plus_tool.exe for HDR10+ preservation and dovi_tool.exe. The current script discovers dovi_tool but does not invoke it; Dolby Vision conversion relies on FFmpeg bitstream filters. See [HDR documentation](docs/hdr.md#optional-external-tools).
 
 ---
 
@@ -97,7 +97,7 @@ Settings live in the `User-configurable settings` block near the top of the `.ps
 pwsh -File .\Video2AV1Queue.ps1 -Mode Doctor
 ```
 
-Read-only. It probes the same capabilities the encoder does and prints the answers, then — with `-TestFile` — tells you what it *would* do with that specific file and why. Because the script degrades gracefully rather than erroring, this is how you tell "working" apart from "working at reduced capability".
+Read-only. It probes the same capabilities the encoder does and prints the answers, then lets you select a test file through the Doctor menu to inspect its planned handling. `TestFile` is an internal tool parameter, not a top-level script switch. Because the script degrades gracefully rather than erroring, this is how you tell "working" apart from "working at reduced capability".
 
 **2. Calibrate the quality thresholds against your own content.**
 
@@ -211,7 +211,7 @@ Two measurements that shaped how this works, both taken with identical encoder s
 
 VMAF moves under two points across sixteen CRF steps on grain, because the score is dominated by noise no bitrate reproduces exactly. A fixed "VMAF ≥ 95" gate therefore rejects every film-grain Blu-ray remux — the files most worth converting.
 
-So the script does not treat "no CRF was transparent" as "this file cannot be converted". It keeps the CRF the Auto ladder chose, says so on one line, and carries on. If your library is mostly grainy film transfers, `$QualityMode = 'Anchor'` compares every CRF against a reference encode of the *same* content instead, which cancels the grain penalty entirely.
+So the script does not treat "no CRF was transparent" as "this file cannot be converted". It keeps the CRF the Auto ladder chose, says so on one line, and carries on. If your library is mostly grainy film transfers, `$QualityMode = 'Anchor'` compares every CRF against a reference encode of the *same* content instead, which makes the comparison relative to that content; it does not guarantee preservation of grain or detail.
 
 **[→ Full explanation, both metrics, and all the settings](docs/quality.md)**
 
@@ -233,13 +233,7 @@ So the script does not treat "no CRF was transparent" as "this file cannot be co
 
 ## Building it yourself
 
-The single file is generated. The sources live in `src\`:
-
-```powershell
-pwsh -File .\Build-Single.ps1
-```
-
-For a source checkout, edit `src\*.ps1`, rebuild, and ship the one file. **The changes documented above were made directly to the distributed `Video2AV1Queue.ps1`; port them into any older source tree before rebuilding, or the rebuild may remove them.** The build refuses to write an output that does not parse, that lost a function, or that kept an `exit` where one would drop a user out of the menu.
+This repository ships the standalone `Video2AV1Queue.ps1` and launcher. It does not currently include a `src` tree or `Build-Single.ps1`. Edit the distributed script for changes to this checkout; validate PowerShell syntax and test copies before using a modified encoder on your library.
 
 ---
 
@@ -257,7 +251,7 @@ For a source checkout, edit `src\*.ps1`, rebuild, and ship the one file. **The c
 
 ## 📜 License
 
-MIT. Optional external tools (`hdr10plus_tool`, `dovi_tool`) are separate MIT-licensed projects by [quietvoid](https://github.com/quietvoid) and are not distributed with this repository.
+MIT. Optional external tools (`hdr10plus_tool`, `dovi_tool`) are separate MIT-licensed projects by [quietvoid](https://github.com/quietvoid) and retain their own licenses; the release packaging described above may include their executables.
 
 ## 🙌 Contributing
 
