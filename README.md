@@ -47,7 +47,7 @@ The release bundles hdr10plus_tool.exe for HDR10+ preservation and dovi_tool.exe
 
 ## Install
 
-Download **`Video2AV1Queue.ps1`** and **`Video2AV1Queue.bat`** from the [latest release](../../releases/latest) into one folder. That is the whole install.
+Download **`Video2AV1Queue.ps1`** and **`Video2AV1Queue.bat`** from the [latest release](../../releases/latest) into one folder. That is the whole install. The AIO Release contains ffmpeg 9.0.2 as well as dovi and hdr10plus tools. 
 
 ```text
 Video2AV1Queue.bat      drag files onto this, or double-click it
