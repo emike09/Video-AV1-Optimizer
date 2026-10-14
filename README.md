@@ -44,14 +44,14 @@ Most full builds — gyan.dev "full", BtbN "gpl" — have everything needed. FFm
 The release bundles hdr10plus_tool.exe for HDR10+ preservation and dovi_tool.exe. The current script discovers dovi_tool but does not invoke it; Dolby Vision conversion relies on FFmpeg bitstream filters. See [HDR documentation](docs/hdr.md#optional-external-tools).
 
 ## Minimum Hardware:
--64-bit Quad-core CPU with AVX support
--16GB RAM
+- 64-bit Quad-core CPU with AVX support
+- 16GB RAM
 
 ## Recommended Hardware
--8-Core+ CPU
--32GB RAM
--Nvidia RTX 4000 or 5000 series or Intel ARC GPU
--Intel CPU with Quick Sync Video v/12.7, Xe2 or Xe3 (For Quick Sync support)
+- 8-Core+ CPU
+- 32GB RAM
+- Nvidia RTX 4000 or 5000 series or Intel ARC GPU
+- Intel CPU with Quick Sync Video v/12.7, Xe2 or Xe3 (For Quick Sync support)
 
 ---
 
