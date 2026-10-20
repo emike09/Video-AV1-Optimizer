@@ -415,13 +415,36 @@ $script:SessionOutcomes      = @{}
 $script:SessionSourceGiB     = 0.0
 $script:SessionOutputGiB     = 0.0
 
+function Get-Av1LogDirectory {
+    param([string]$ScriptDirectory = $PSScriptRoot)
+    $directory = Join-Path $ScriptDirectory 'Logs'
+    $null = New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop
+    return $directory
+}
+
+function Resolve-EncodeHistoryPath {
+    param([string]$ScriptDirectory = $PSScriptRoot)
+    $destination = Join-Path (Get-Av1LogDirectory -ScriptDirectory $ScriptDirectory) 'encode_log.csv'
+    if (-not (Test-Path -LiteralPath $destination)) {
+        foreach ($legacy in @((Join-Path $ScriptDirectory '.queue\encode_log.csv'), (Join-Path $ScriptDirectory 'encode_log.csv'))) {
+            if (Test-Path -LiteralPath $legacy -PathType Leaf) {
+                # Preserve legacy history for rollback and never overwrite a
+                # history file the user has already moved into Logs.
+                [IO.File]::Copy($legacy, $destination, $false)
+                break
+            }
+        }
+    }
+    return $destination
+}
+
 # Queue / log paths  (all relative to the script's own directory)
 $QueueRoot       = Join-Path $PSScriptRoot ".queue"
 $QueuePendingDir = Join-Path $QueueRoot "pending"
 $QueueWorkingDir = Join-Path $QueueRoot "working"
 $BackupDir       = Join-Path $QueueRoot "backup_originals"
 $PreflightDir    = Join-Path $QueueRoot "preflight"
-$LogPath         = Join-Path $QueueRoot "encode_log.csv"
+$LogPath         = Resolve-EncodeHistoryPath -ScriptDirectory $PSScriptRoot
 $StatePath       = Join-Path $QueueRoot "current_job.json"
 
 $LogColumns = @(
@@ -769,7 +792,7 @@ function Resolve-SessionTextLogPath {
     if (-not $hasActiveQueueSession) { return $null }
 
     try {
-        $latest = @(Get-ChildItem -LiteralPath $QueueRoot -Filter *.log -File -ErrorAction SilentlyContinue |
+        $latest = @(Get-ChildItem -LiteralPath @((Get-Av1LogDirectory), $QueueRoot) -Filter *.log -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1)
         if ($latest.Count -gt 0) {
@@ -879,11 +902,11 @@ function Write-SessionEncodeStart {
 
 function Start-SessionTextLog {
     $stamp = Get-Date -Format 'HH-mm-yyyy-MM-dd'
-    $candidatePath = Join-Path $QueueRoot ("{0}.log" -f $stamp)
+    $candidatePath = Join-Path (Get-Av1LogDirectory) ("{0}.log" -f $stamp)
     $suffix = 1
     while (Test-Path -LiteralPath $candidatePath) {
         $suffix++
-        $candidatePath = Join-Path $QueueRoot ("{0}_{1}.log" -f $stamp, $suffix)
+        $candidatePath = Join-Path (Get-Av1LogDirectory) ("{0}_{1}.log" -f $stamp, $suffix)
     }
 
     $script:SessionLogPath = $candidatePath
@@ -2750,12 +2773,24 @@ function Suspend-ProcessThreads {
             [void][Media2Av1ThreadControl]::CloseHandle($handle)
         }
     }
+    # Standalone HDR workers own a decoder, encoder and later a remuxer.
+    # Suspend the coordinator first so it cannot launch another child mid-pause.
+    if ($Process.ProcessName -eq 'pwsh') {
+        foreach ($child in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($Process.Id)" -ErrorAction Stop)) {
+            try { Suspend-ProcessThreads -Process (Get-Process -Id $child.ProcessId -ErrorAction Stop) } catch { Write-Warning $_.Exception.Message }
+        }
+    }
 }
 
 function Resume-ProcessThreads {
     param([System.Diagnostics.Process]$Process)
 
     if ($null -eq $Process) { return }
+    if ($Process.ProcessName -eq 'pwsh') {
+        foreach ($child in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($Process.Id)" -ErrorAction Stop)) {
+            try { Resume-ProcessThreads -Process (Get-Process -Id $child.ProcessId -ErrorAction Stop) } catch { Write-Warning $_.Exception.Message }
+        }
+    }
     Ensure-ProcessThreadControlInterop
 
     $threadAccess = 0x0002
@@ -2884,7 +2919,7 @@ function Stop-WorkerByUser {
     Set-WorkerState -Worker $Worker -State 'Stopping'
     Set-ConsoleStatusMessage -Message ("Worker {0} stop requested." -f $Worker.SlotNumber) -Level Warn -Log $true
     try {
-        $Worker.TrackedProcess.Process.Kill()
+        $Worker.TrackedProcess.Process.Kill($true)
     } catch {
         Set-ConsoleStatusMessage -Message ("Could not stop worker {0}: {1}" -f $Worker.SlotNumber, $_.Exception.Message) -Level Err -Log $true
     }
@@ -3197,7 +3232,7 @@ function Request-WorkerShutdown {
             $slot = Get-OptionalProperty -InputObject $Worker -PropertyName 'SlotNumber' -Default '?'
             Write-Host ("Shutdown: worker {0} did not exit in time; terminating ffmpeg." -f $slot) -ForegroundColor Yellow
             Write-SessionTextLogMessage -Level Warn -Message ("Shutdown | worker {0} did not exit in time; terminating ffmpeg." -f $slot)
-            $process.Kill()
+            $process.Kill($true)
             if ($Worker.PSObject.Properties['ShutdownRequestedAt']) {
                 $Worker.ShutdownRequestedAt = (Get-Date).AddYears(50)
             } else {
@@ -4047,7 +4082,7 @@ function Invoke-FfmpegSync {
                     Start-Sleep -Milliseconds 200
                 }
                 if (-not $tracked.Process.HasExited) {
-                    try { $tracked.Process.Kill() } catch {}
+                    try { $tracked.Process.Kill($true) } catch {}
                 }
                 throw $script:QueueShutdownSentinel
             }
@@ -5255,6 +5290,7 @@ function Build-PreflightSampleArgs {
     $ffArgs.Add($OutputPath)
 
     $result = [string[]]$ffArgs.ToArray()
+    if ($EncodeMode -eq 'software') { return (ConvertTo-SvtHdrInvocation -Arguments $result -HdrPlan $HdrPlan -SourceProfile $SourceProfile) }
     return ,$result
 }
 
@@ -6029,7 +6065,7 @@ function Get-ColorSummary {
 }
 
 function Get-EncodeColorProfile {
-    param($SourceProfile)
+    param($SourceProfile, $HdrPlan = $null)
 
     $encodeBitDepth = 10
     if ($SourceProfile.HasHDR) {
@@ -6070,6 +6106,9 @@ function Get-EncodeColorProfile {
         $note = ''
     }
 
+    if ($HdrPlan -and $HdrPlan.IsHdr) {
+        $encodeDynamicRange = if ($HdrPlan.PreserveHDR10Plus) { 'HDR10+' } else { $HdrPlan.TargetDynamicRange }
+    }
     return [ordered]@{
         BitDepth           = $encodeBitDepth
         DynamicRangeLabel  = $encodeDynamicRange
@@ -6358,6 +6397,13 @@ function Get-HdrToolchainEnvironment {
         }
     }
 
+    $svtHdrAppPath = Get-HdrToolPath -ToolName 'SvtAv1EncApp'
+    if ($svtHdrAppPath) {
+        try {
+            $appHelp = (& $svtHdrAppPath --help 2>&1 | Out-String)
+            if ($appHelp -notmatch '--hdr10plus-json') { $svtHdrAppPath = $null }
+        } catch { $svtHdrAppPath = $null }
+    }
     $doviToolPath = Get-HdrToolPath -ToolName 'dovi_tool'
 
     $script:HdrToolchainCache = [ordered]@{
@@ -6372,6 +6418,7 @@ function Get-HdrToolchainEnvironment {
         Hdr10PlusToolPath              = $hdr10PlusToolPath
         Hdr10PlusToolVersion           = $hdr10PlusVersion
         Hdr10PlusToolSupportsAv1       = [bool]$hdr10PlusAv1
+        SvtHdrAppPath                 = $svtHdrAppPath
         DoviToolPath                   = $doviToolPath
     }
 
@@ -6831,7 +6878,7 @@ function Resolve-HdrEncodePlan {
         CarryStaticMetadata  = $false
         StaticMetadataRoute  = 'none'     # ffmpeg_options | svtav1_params | none
         PreserveHDR10Plus    = $false
-        Hdr10PlusRoute       = 'none'     # svt_inline | post_inject | none
+        Hdr10PlusRoute       = 'none'     # svt_app | svt_inline | post_inject | none
         Hdr10PlusJsonPath    = $null
         DolbyVision          = $null
         InputBitstreamFilter = $null
@@ -6956,7 +7003,7 @@ function Resolve-HdrEncodePlan {
         # already committed to NVENC, and only give up if that is unavailable too.
         $inlineAvailable = $toolchain.SupportsSvtHdr10PlusJson -and $toolchain.Hdr10PlusToolPath -and ($EncodeMode -eq 'software')
 
-        if ($EncodeMode -in @('nvenc', 'qsv') -and $toolchain.SupportsSvtHdr10PlusJson) {
+        if ($EncodeMode -in @('nvenc', 'qsv') -and ($toolchain.SupportsSvtHdr10PlusJson -or $toolchain.SvtHdrAppPath)) {
             $plan.RequiresCpuLane       = $true
             $plan.RequiresCpuLaneReason = 'HDR10+ can be carried inline only by the SVT-AV1 (CPU) lane; the Nvidia lane needs post-encode injection.'
         }
@@ -6964,6 +7011,10 @@ function Resolve-HdrEncodePlan {
         if ($inlineAvailable) {
             $plan.PreserveHDR10Plus = $true
             $plan.Hdr10PlusRoute    = 'svt_inline'
+        } elseif ($toolchain.SvtHdrAppPath -and $toolchain.Hdr10PlusToolPath -and $EncodeMode -eq 'software') {
+            $plan.PreserveHDR10Plus = $true
+            $plan.Hdr10PlusRoute = 'svt_app'
+            $plan.Notes.Add('HDR10+ will be carried by standalone SVT-AV1-HDR, then verified after remux. Failure retries as HDR10.')
         } elseif ($toolchain.Hdr10PlusToolPath -and $toolchain.Hdr10PlusToolSupportsAv1) {
             $plan.PreserveHDR10Plus = $true
             $plan.Hdr10PlusRoute    = 'post_inject'
@@ -7107,7 +7158,13 @@ function Export-HDR10PlusMetadata {
         )
 
         & $FfmpegPath @ffmpegArgs 2>$null |
-            & $toolchain.Hdr10PlusToolPath extract -o $jsonPath - 2>$null
+            & $toolchain.Hdr10PlusToolPath extract -o $jsonPath - 2>$null |
+            Out-Null
+        # Native progress text must not become part of the result object.
+        $extractExitCode = $LASTEXITCODE
+        if ($extractExitCode -ne 0) {
+            throw "hdr10plus_tool exited with code $extractExitCode."
+        }
 
         if ((Test-Path -LiteralPath $jsonPath) -and ((Get-Item -LiteralPath $jsonPath).Length -gt 0)) {
             return [ordered]@{ Success = $true; Path = $jsonPath; Reason = 'HDR10+ metadata extracted to JSON sidecar.' }
@@ -8874,6 +8931,7 @@ function Get-EncodeInitialization {
         }
     }
 
+    $encodeColorProfile = Get-EncodeColorProfile -SourceProfile $sourceProfile -HdrPlan $hdrPlan
     $hdrPlanSummary = Get-HdrPlanSummary -HdrPlan $hdrPlan
     Write-HostOnce -Key $InputPath -Message ("HDR: {0}" -f $hdrPlanSummary) -ForegroundColor DarkCyan
     Write-SessionTextLogMessage -Level Info -Message ("HDR plan | {0} | {1}" -f $displayInputName, $hdrPlanSummary)
@@ -9203,7 +9261,20 @@ function Resolve-EncoderLaneForHardware {
 
     $probe = Invoke-FfprobeJson -InputPath $InputPath
     $selected = Select-Streams -Probe $probe
-    $sourceProfile = Get-SourceProfile -Probe $probe -VideoStream $selected.Video
+    $sourceProfile = Get-SourceProfile -Probe $probe -VideoStream $selected.Video -InputPath $InputPath
+    if ((Get-OptionalProperty $sourceProfile 'HasHDR10Plus' $false) -and "$PreserveHDR10Plus" -in @('Auto','True')) {
+        $hdrTools = Get-HdrToolchainEnvironment
+        if ($hdrTools.SvtHdrAppPath -and $hdrTools.Hdr10PlusToolPath -and -not $hdrTools.Hdr10PlusToolSupportsAv1) {
+            if (-not $CpuLaneAvailable) {
+                return [pscustomobject]@{Ready=$false;Reason='Waiting for CPU to retain HDR10+ with standalone SVT-AV1-HDR.';Init=$null;HeldForCpuLane=$true}
+            }
+            return [pscustomobject]@{
+                Ready=$true
+                Reason='CPU selected to retain HDR10+ with standalone SVT-AV1-HDR.'
+                Init=(Get-EncodeInitialization -InputPath $InputPath -EncodeMode 'software' -EncoderPreferenceValue $EncoderPreferenceValue -LaneSelectionReason 'CPU selected for HDR10+ preservation using standalone SVT-AV1-HDR' -AutoCRFOffsetOverrideValue $AutoCRFOffsetOverrideValue -TargetGiBPerHourOverrideValue $TargetGiBPerHourOverrideValue)
+            }
+        }
+    }
     $autoSettings = Get-AutoEncodeSettings `
         -Probe $probe `
         -VideoStream $selected.Video `
@@ -9900,14 +9971,242 @@ function Write-ProgressUI {
     return (Write-QueueConsoleFrame -Lines $lines.ToArray())
 }
 
+function Get-SvtHdrWorkerSource {
+    return @'
+param([string]$JobBase64)
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$job=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($JobBase64)) | ConvertFrom-Json -Depth 30
+$children=[Collections.Generic.List[Diagnostics.Process]]::new()
+Add-Type -TypeDefinition 'using System; using System.Threading.Tasks; public static class SvtHdrQuitReader { public static Task<string> Read() { return Task.Run(() => Console.ReadLine()); } }'
+$quit=[SvtHdrQuitReader]::Read()
+function Start-Child([string]$Executable,[string[]]$Arguments,[bool]$InputPipe=$false,[bool]$OutputPipe=$false) {
+    $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=$Executable;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true
+    $psi.RedirectStandardError=$true;$psi.RedirectStandardInput=$InputPipe;$psi.RedirectStandardOutput=$OutputPipe
+    foreach($arg in $Arguments){$psi.ArgumentList.Add($arg)}
+    $p=[Diagnostics.Process]::Start($psi);$children.Add($p)
+    try{$p.PriorityClass=[Diagnostics.Process]::GetCurrentProcess().PriorityClass}catch{}
+    return $p
+}
+function Check-Quit {
+    if($null -ne $quit -and $quit.IsCompleted){$answer=$quit.GetAwaiter().GetResult();if($answer -eq 'q'){throw [OperationCanceledException]::new('Standalone worker cancelled.')};$script:quit=$null}
+}
+function Wait-Child($Process,$ErrorTask) {
+    while(-not $Process.WaitForExit(200)){Check-Quit}
+    $detail=$ErrorTask.GetAwaiter().GetResult()
+    if($Process.ExitCode -ne 0){throw "Child exit $($Process.ExitCode): $($detail.Substring([Math]::Max(0,$detail.Length-1800)))"}
+}
+function Run-Ffmpeg([string[]]$Arguments){
+    $p=Start-Child $job.Ffmpeg (@('-nostdin')+$Arguments)
+    $line=$p.StandardError.ReadLineAsync();$tail=[Collections.Generic.Queue[string]]::new()
+    while(-not $p.HasExited -or -not $line.IsCompleted -or -not $p.StandardError.EndOfStream){
+        Check-Quit
+        if($line.IsCompleted){
+            $text=$line.GetAwaiter().GetResult();if($null -eq $text){break}
+            [Console]::Error.WriteLine($text);$tail.Enqueue($text);if($tail.Count -gt 12){$null=$tail.Dequeue()}
+            $line=$p.StandardError.ReadLineAsync()
+        }else{Start-Sleep -Milliseconds 100}
+    }
+    $p.WaitForExit()
+    if($p.ExitCode -ne 0){throw ('FFmpeg stage failed: '+($tail -join ' | '))}
+}
+function Has-Hdr10Plus([string]$Path,[double]$Position=0){
+    $culture=[Globalization.CultureInfo]::InvariantCulture
+    $interval=$Position.ToString('0.###',$culture)+'%'+($Position+1).ToString('0.###',$culture)
+    $p=Start-Child $job.Ffprobe @('-v','error','-select_streams','v:0','-read_intervals',$interval,'-show_frames','-of','json',$Path) $false $true
+    $err=$p.StandardError.ReadToEndAsync();$out=$p.StandardOutput.ReadToEndAsync();Wait-Child $p $err
+    $data=$out.GetAwaiter().GetResult() | ConvertFrom-Json -Depth 50
+    # Seeking may land on an earlier keyframe. Verify frames at the requested
+    # time, rather than mistaking those earlier frames for an end-of-file test.
+    $frames=@($data.frames | Where-Object {[double]::Parse($_.best_effort_timestamp_time,$culture) -ge ($Position-0.001)})
+    if(-not $frames.Count){return $false}
+    foreach($frame in $frames){if(-not @($frame.side_data_list | Where-Object {$_.side_data_type -match '2094-40|HDR10\+'}).Count){return $false}}
+    return $true
+}
+$ivf=$job.Output+'.svt-hdr.ivf';$localJson=$job.Output+'.svt-hdr.json';$status=$job.Output+'.hdr10plus-result.json'
+$success=$false;$cancelled=$false
+try {
+    try {
+        if($job.Fps -le 0){throw 'No usable constant-frame-rate timing for standalone HDR10+.'}
+        if($job.Start -gt 0 -or $job.Duration -gt 0){
+            # Accurate FFmpeg seeking keeps the first frame at/after the seek.
+            $first=[int][Math]::Ceiling($job.Start*$job.Fps-0.000001)
+            $count=if($job.Duration -gt 0){[int][Math]::Ceiling($job.Duration*$job.Fps)}else{[int]::MaxValue}
+            $document=[Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($job.Json))
+            $stream=[IO.File]::Create($localJson);$writer=[Text.Json.Utf8JsonWriter]::new($stream)
+            try{
+                $writer.WriteStartObject()
+                foreach($property in $document.RootElement.EnumerateObject()){
+                    if($property.Name -eq 'SceneInfoSummary'){continue}
+                    $writer.WritePropertyName($property.Name)
+                    if($property.Name -ne 'SceneInfo'){$property.Value.WriteTo($writer);continue}
+                    $writer.WriteStartArray();$index=0;$written=0
+                    foreach($scene in $property.Value.EnumerateArray()){
+                        if($index++ -lt $first){continue};if($written -ge $count){break}
+                        $writer.WriteStartObject()
+                        foreach($field in $scene.EnumerateObject()){
+                            $writer.WritePropertyName($field.Name)
+                            if($field.Name -in @('SceneFrameIndex','SequenceFrameIndex')){$writer.WriteNumberValue([int]$written)}elseif($field.Name -eq 'SceneId'){$writer.WriteNumberValue(0)}else{$field.Value.WriteTo($writer)}
+                        }
+                        $writer.WriteEndObject();$written++
+                    }
+                    $writer.WriteEndArray()
+                    if(-not $written){throw 'No HDR10+ metadata for requested sample.'}
+                }
+                $writer.WritePropertyName('SceneInfoSummary')
+                $writer.WriteRawValue(('{"SceneFirstFrameIndex":[0],"SceneFrameNumbers":[COUNT]}' -replace 'COUNT',[string]$written))
+                $writer.WriteEndObject();$writer.Flush()
+            }finally{$writer.Dispose();$stream.Dispose();$document.Dispose()}
+        }else{[IO.File]::Copy($job.Json,$localJson,$true)}
+        $appArgs=@('-i','stdin','-b',$ivf,'--hdr10plus-json',$localJson,'--progress','0')+@($job.EncoderArgs)
+        $encoder=Start-Child $job.Encoder $appArgs $true $true
+        $encOutput=$encoder.StandardOutput.ReadToEndAsync()
+        $encError=$encoder.StandardError.ReadToEndAsync()
+        $decoder=Start-Child $job.Ffmpeg @($job.DecodeArgs) $false $true
+        $decError=$decoder.StandardError.ReadToEndAsync()
+        $copy=$decoder.StandardOutput.BaseStream.CopyToAsync($encoder.StandardInput.BaseStream)
+        $watch=[Diagnostics.Stopwatch]::StartNew()
+        $ivfOffset=32L;$encodedFrames=0L
+        while(-not $copy.IsCompleted){
+            Check-Quit
+            if($encoder.HasExited -and $encoder.ExitCode -ne 0){throw ($encError.GetAwaiter().GetResult())}
+            if(Test-Path -LiteralPath $ivf){
+                # Count completed IVF frame records without decoding the file.
+                try{
+                    $stream=[IO.File]::Open($ivf,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+                    try{
+                        $reader=[IO.BinaryReader]::new($stream);$stream.Position=$ivfOffset
+                        while($stream.Position+12 -le $stream.Length){$size=$reader.ReadUInt32();$null=$reader.ReadUInt64();if($stream.Position+$size -gt $stream.Length){break};$stream.Position+=$size;$encodedFrames++;$ivfOffset=$stream.Position}
+                        $seconds=$encodedFrames/$job.Fps
+                        [Console]::Error.WriteLine('out_time_us='+[int64]($seconds*1000000))
+                        [Console]::Error.WriteLine('total_size='+$stream.Length)
+                        [Console]::Error.WriteLine('speed='+($seconds/[Math]::Max(0.01,$watch.Elapsed.TotalSeconds)).ToString('0.###',[Globalization.CultureInfo]::InvariantCulture)+'x')
+                    }finally{$stream.Dispose()}
+                }catch{}
+            }
+            Start-Sleep -Milliseconds 1000
+        }
+        $null=$copy.GetAwaiter().GetResult();$encoder.StandardInput.Close()
+        Wait-Child $decoder $decError
+        while(-not $encoder.WaitForExit(200)){Check-Quit}
+        Wait-Child $encoder $encError
+        # Remux uses the original argument builder's mapping, subtitle conversion,
+        # colour tags, metadata and dispositions, replacing only video encoding.
+        Run-Ffmpeg @($job.MuxArgs)
+        foreach($position in @(0,($job.ExpectedDuration*0.5),([Math]::Max(0,$job.ExpectedDuration-2)))){
+            if(-not (Has-Hdr10Plus $job.Output $position)){throw "HDR10+ verification failed at $position seconds."}
+        }
+        @{Preserved=$true;Reason='Standalone SVT-AV1-HDR; HDR10+ verified at start, middle and end.'} | ConvertTo-Json | Set-Content -LiteralPath $status -Encoding utf8
+        [Console]::Error.WriteLine('HDR10+ standalone encode and metadata verification succeeded.')
+        $success=$true
+    }catch [OperationCanceledException]{$cancelled=$true;throw}
+    catch{
+                $reason=$_.Exception.Message
+        if(Get-Variable encError -ErrorAction SilentlyContinue){try{$text=$encError.GetAwaiter().GetResult();$reason+=' | '+$text.Substring([Math]::Max(0,$text.Length-2500))}catch{}}
+        foreach($p in $children){try{if(-not $p.HasExited){$p.Kill($true);$p.WaitForExit()}}catch{}}
+        [Console]::Error.WriteLine('HDR10+ standalone failed; retrying as HDR10: '+$reason)
+        # The fallback arguments never contain HDR10+ JSON options or a claim
+        # that the output retained dynamic metadata.
+        Run-Ffmpeg @($job.FallbackArgs)
+        @{Preserved=$false;Reason=$reason} | ConvertTo-Json | Set-Content -LiteralPath $status -Encoding utf8
+        $success=$true
+    }
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+} finally {
+    foreach($p in $children){try{if(-not $p.HasExited){$p.Kill($true);$p.WaitForExit()};$p.Dispose()}catch{}}
+    foreach($path in @($ivf,$localJson)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue}}
+}
+if($success){exit 0}else{exit 1}
+
+
+
+
+'@
+}
+function ConvertTo-SvtHdrInvocation {
+    param([string[]]$Arguments,$HdrPlan,$SourceProfile)
+    if(-not $HdrPlan -or -not $HdrPlan.PreserveHDR10Plus -or $HdrPlan.Hdr10PlusRoute -ne 'svt_app'){return ,$Arguments}
+    $inputIndex=[Array]::IndexOf($Arguments,'-i');$inputPath=$Arguments[$inputIndex+1];$output=$Arguments[-1]
+    $seek=0.0;$duration=0.0
+    $decode=[Collections.Generic.List[string]]::new();$decode.AddRange([string[]]@('-hide_banner','-loglevel','error','-nostdin'))
+    for($i=0;$i -lt $inputIndex;$i++){
+        if($Arguments[$i] -in @('-ss','-t','-bsf:v')){
+            $key=$Arguments[$i];$value=$Arguments[++$i];$decode.AddRange([string[]]@($key,$value))
+            if($key -eq '-ss'){$seek=[double]::Parse($value,[Globalization.CultureInfo]::InvariantCulture)}
+            if($key -eq '-t'){$duration=[double]::Parse($value,[Globalization.CultureInfo]::InvariantCulture)}
+        }
+    }
+    $decode.AddRange([string[]]@('-i',$inputPath))
+    $mapIndex=[Array]::IndexOf($Arguments,'-map');$videoMap=$Arguments[$mapIndex+1]
+    $decode.AddRange([string[]]@('-map',$videoMap,'-an','-sn','-dn','-pix_fmt','yuv420p10le','-fps_mode','passthrough','-strict','-1','-f','yuv4mpegpipe','pipe:1'))
+    $encoder=[Collections.Generic.List[string]]::new()
+    $encoder.AddRange([string[]]@('--input-depth','10','--color-primaries','9','--transfer-characteristics','16','--matrix-coefficients','9'))
+    foreach($option in @(@('-preset','--preset'),@('-crf','--crf'))){$index=[Array]::IndexOf($Arguments,$option[0]);if($index -ge 0){$encoder.AddRange([string[]]@($option[1],$Arguments[$index+1]))}}
+    $index=[Array]::IndexOf($Arguments,'-svtav1-params')
+    if($index -ge 0){foreach($pair in ($Arguments[$index+1] -split ':')){$key,$value=$pair -split '=',2;if($key -eq 'hdr10plus-json'){continue};$key=if($key -eq 'overlays'){'enable-overlays'}else{$key};$encoder.AddRange([string[]]@("--$key",$value))}}
+    $mux=[Collections.Generic.List[string]]::new();$mux.AddRange([string[]]@('-hide_banner','-loglevel','warning','-nostdin','-y','-i',($output+'.svt-hdr.ivf')))
+    if($seek -gt 0){$mux.AddRange([string[]]@('-ss',$seek.ToString('0.########',[Globalization.CultureInfo]::InvariantCulture)))}
+    if($duration -gt 0){$mux.AddRange([string[]]@('-t',$duration.ToString('0.########',[Globalization.CultureInfo]::InvariantCulture)))}
+    $mux.AddRange([string[]]@('-i',$inputPath))
+    for($i=$inputIndex+2;$i -lt $Arguments.Count-1;$i++){
+        $key=$Arguments[$i]
+        if($key -in @('-preset','-crf','-pix_fmt','-svtav1-params','-dolbyvision','-progress','-stats_period','-mastering_display','-content_light')){$i++;continue}
+        if($key -eq '-c:v'){$i++;$mux.AddRange([string[]]@('-c:v','copy'));continue}
+        if($key -eq '-map'){$value=$Arguments[++$i];if($value -eq $videoMap){$value='0:v:0'}elseif($value -match '^0:'){$value=$value -replace '^0:','1:'};$mux.AddRange([string[]]@('-map',$value));continue}
+        if($key -eq '-map_chapters'){$i++;$mux.AddRange([string[]]@('-map_chapters','1'));continue}
+        $mux.Add($key)
+    }
+    $mux.Add($output)
+    $fallback=[string[]]$Arguments.Clone()
+    for($i=1;$i -lt $fallback.Count;$i++) {
+        if($fallback[$i-1] -eq '-metadata:s:v:0') { $fallback[$i]=$fallback[$i] -replace 'HDR10\+','HDR10' }
+    }
+    $probe=Invoke-FfprobeJson -InputPath $inputPath
+    $expected=if($duration -gt 0){$duration}else{Convert-ToInvariantDouble $probe.format.duration 0}
+    $spec=@{Ffmpeg=$FfmpegPath;Ffprobe=$FfprobePath;Encoder=$HdrPlan.Toolchain.SvtHdrAppPath;Json=$HdrPlan.Hdr10PlusJsonPath;Output=$output;Start=$seek;Duration=$duration;Fps=[double]$SourceProfile.FrameRate;ExpectedDuration=$expected;DecodeArgs=$decode.ToArray();EncoderArgs=$encoder.ToArray();MuxArgs=$mux.ToArray();FallbackArgs=$fallback}
+    return ,[string[]]@('__SVT_HDR_APP__',[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($spec | ConvertTo-Json -Depth 8 -Compress))))
+}
+
+function Get-SvtHdrWorkerPath {
+    # Generated implementation is embedded in this single distributed script.
+    $source=Get-SvtHdrWorkerSource
+    $hash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($source))).Substring(0,16)
+    $path=Join-Path $QueueRoot ("svt-hdr-worker-$hash.ps1")
+    if(-not(Test-Path -LiteralPath $path)){[IO.File]::WriteAllText($path,$source,[Text.UTF8Encoding]::new($false))}
+    return $path
+}
+
+function Get-EncoderProcessLaunch {
+    param([string[]]$Arguments)
+    if($Arguments.Count -gt 0 -and $Arguments[0] -eq '__SVT_HDR_APP__'){
+        return @{Executable=(Join-Path $PSHOME 'pwsh.exe');Arguments=[string[]]@('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Get-SvtHdrWorkerPath),'-JobBase64',$Arguments[1])}
+    }
+    return @{Executable=$FfmpegPath;Arguments=$Arguments}
+}
+
+function Update-StandaloneHdrResult {
+    param($Init)
+    $path=$Init.TempOutput+'.hdr10plus-result.json'
+    if(-not(Test-Path -LiteralPath $path)){return}
+    try{
+        $result=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        if(-not $result.Preserved){$Init.HdrPlan.PreserveHDR10Plus=$false;$Init.HdrPlan.Hdr10PlusRoute='none';$Init.HdrPlan.TargetDynamicRange='HDR10';$Init.HdrPlan.Notes.Add("Standalone HDR10+ fallback: $($result.Reason)")}
+        $Init.EncodeColorProfile=Get-EncodeColorProfile -SourceProfile $Init.SourceProfile -HdrPlan $Init.HdrPlan
+        Write-SessionTextLogMessage -Level $(if($result.Preserved){'Info'}else{'Warn'}) -Message ("HDR10+ standalone result | {0} | {1}" -f $Init.InputPath,$result.Reason)
+    }finally{Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue}
+}
+
 function Start-TrackedFfmpegProcess {
     param(
         [string[]]$Arguments,
         [string]$PriorityName = 'Normal'
     )
 
+    $launch = Get-EncoderProcessLaunch -Arguments $Arguments
+    $Arguments = $launch.Arguments
     $psi                       = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName              = $FfmpegPath
+    $psi.FileName              = $launch.Executable
     $psi.RedirectStandardError = $true
     $psi.RedirectStandardInput = $true
     $psi.UseShellExecute       = $false
@@ -10119,7 +10418,7 @@ function Build-SoftwareFfmpegArgs {
     $ffArgs.AddRange([string[]]@('-progress', 'pipe:2', '-stats_period', '2'))
     $ffArgs.Add($Init.TempOutput)
 
-    return ,$ffArgs
+    return (ConvertTo-SvtHdrInvocation -Arguments ([string[]]$ffArgs.ToArray()) -HdrPlan $hdrPlan -SourceProfile $sourceProfile)
 }
 
 function Build-NvencFfmpegArgs {
@@ -10451,6 +10750,7 @@ function Complete-LaneWorker {
     $isQsv = ($init.ResolvedEncodeLane -eq 'Intel')
 
     $hdrPlan = Get-OptionalProperty -InputObject $init -PropertyName 'HdrPlan' -Default $null
+    Update-StandaloneHdrResult -Init $init
     $hdrLogFields = Get-HdrLogFields -Init $init
     $qualityLogFields = Get-QualityLogFields -Init $init
 
@@ -12039,7 +12339,7 @@ function Invoke-EncodeJob {
         }
         if (-not $proc.HasExited) {
             Write-Host "Shutdown: software encode did not exit in time; terminating ffmpeg." -ForegroundColor Yellow
-            try { $proc.Kill() } catch {}
+            try { $proc.Kill($true) } catch {}
         }
     }
 
@@ -12372,6 +12672,10 @@ function Invoke-QueueProcessing {
     }
 
     switch ($script:QueueLoopPreference) {
+        'CPU' {
+            Invoke-AutoEncoderLaneQueueProcessing -NvencEnvironment $script:NvencEnvironment
+            return
+        }
         'Intel' {
             Invoke-AutoEncoderLaneQueueProcessing -NvencEnvironment $script:NvencEnvironment
             return
@@ -12814,6 +13118,12 @@ Write-Item 'SVT-AV1 hdr10plus-json' $(if ($svtHdr10Plus) { 'supported' } else { 
     $(if ($svtHdr10Plus) { '' } else { 'Mainline SVT-AV1 does not have this. It needs svt-av1-hdr or SVT-AV1-PSY built with enable-hdr10plus.' })
 
 $h10Tool = Find-Binary 'hdr10plus_tool'
+$svtApp = Find-Binary 'SvtAv1EncApp'
+$svtAppHdr = $false
+if ($svtApp) {
+    try { $svtAppHdr = ((& $svtApp --help 2>&1 | Out-String) -match '--hdr10plus-json') } catch {}
+}
+Write-Item 'Standalone SVT-AV1-HDR' $(if ($svtAppHdr) { $svtApp } else { 'not available' }) $(if ($svtAppHdr) { 'ok' } else { 'info' })
 $h10Av1 = $false
 if ($h10Tool) {
     try {
@@ -12827,6 +13137,7 @@ if ($h10Tool) {
 }
 
 $route = if ($svtHdr10Plus -and $h10Tool) { 'inline via SVT-AV1 (best)' }
+         elseif ($svtAppHdr -and $h10Tool) { 'standalone SVT-AV1-HDR (CPU), verified after remux' }
          elseif ($h10Tool -and $h10Av1)   { 'post-encode injection' }
          else                             { 'NONE - HDR10+ will be dropped' }
 Write-Item 'HDR10+ route' $route $(if ($route -like 'NONE*') { 'warn' } else { 'ok' })
@@ -13262,7 +13573,7 @@ Write-Host ''
 # learned from forty of your own encodes and a number I guessed should never
 # look the same on screen.
 if ([string]::IsNullOrWhiteSpace($HistoryCsv)) {
-    $HistoryCsv = Join-Path $PSScriptRoot '.queue\encode_log.csv'
+    $HistoryCsv = Resolve-EncodeHistoryPath
 }
 
 $script:HistorySavings = @{}   # "tier|codecClass|bppTier" -> @{ Median; Count }
@@ -14790,8 +15101,10 @@ function Test-QueueShutdownRequested { return $false }
 function Invoke-FfmpegSync {
     param([string[]]$Arguments)
 
+    $launch = Get-EncoderProcessLaunch -Arguments $Arguments
+    $Arguments = $launch.Arguments
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $FfmpegPath
+    $psi.FileName = $launch.Executable
     foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
     $psi.RedirectStandardError  = $true
     $psi.RedirectStandardOutput = $true
@@ -15148,7 +15461,7 @@ if ($ThrottleLimit -le 0) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Csv)) {
-    $Csv = Join-Path (Get-Location) ("hdr_census_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $Csv = Join-Path (Get-Av1LogDirectory) ("hdr_census_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
 
 Write-Host ""
@@ -16591,7 +16904,7 @@ Say  "  This is the real script, on the real queue, with real encoding." 'DarkGr
 Say  "  Console output below is the encoder's own." 'DarkGray'
 Write-Host ""
 
-$logPath = Join-Path $PSScriptRoot '.queue\encode_log.csv'
+$logPath = Resolve-EncodeHistoryPath
 $logBefore = if (Test-Path -LiteralPath $logPath) { @(Import-Csv -LiteralPath $logPath).Count } else { 0 }
 
 $stagedPaths = @($cases | ForEach-Object { $_.StagedPath })
@@ -16887,7 +17200,7 @@ if ($KeepSandbox) {
 } else {
     Say  "  (pass -KeepSandbox to keep the encoded outputs for viewing)" 'DarkGray'
     # Results CSV is preserved even when the media is not.
-    $keepCsv = Join-Path $PSScriptRoot ("verify_results_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $keepCsv = Join-Path (Get-Av1LogDirectory) ("verify_results_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     Copy-Item -LiteralPath $csvOut -Destination $keepCsv -Force -ErrorAction SilentlyContinue
     Say ("  results copied to: {0}" -f $keepCsv) 'DarkGray'
     Remove-Item -LiteralPath $SandboxRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -17194,8 +17507,8 @@ function Invoke-CandidatesMenuAction {
     Write-Host 'space they give back per hour of encoding. Read-only.' -ForegroundColor DarkGray
 
     $paths = Read-PathList -Prompt 'Library folder(s) to scan'
-    $csv = Join-Path $PSScriptRoot ('candidates_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-    $list = Join-Path $PSScriptRoot ('candidates_{0}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $csv = Join-Path (Get-Av1LogDirectory) ('candidates_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $list = Join-Path (Get-Av1LogDirectory) ('candidates_{0}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
     Write-Host 'Estimate encoding time for which lane? CPU, Nvidia, or Intel (one worker; not mixed Auto scheduling).'
     $lane = Read-MenuChoice -Prompt 'Estimate lane (Enter = CPU)' -Valid @('CPU','Nvidia','Intel') -Default 'CPU'
@@ -17226,7 +17539,7 @@ function Invoke-LoudnessMenuAction {
     if ($what -eq 'B') { return }
 
     $paths = Read-PathList -Prompt 'File(s) or folder(s)'
-    $csv = Join-Path $PSScriptRoot ('loudness_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $csv = Join-Path (Get-Av1LogDirectory) ('loudness_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
     switch ($what) {
         '1' { Invoke-LoudnessTool -Path $paths -Quick -Csv $csv }
@@ -17265,7 +17578,7 @@ function Invoke-LibraryScanMenuAction {
     Write-Host 'HDR, HDR10+ and Dolby Vision census of a library. Read-only.' -ForegroundColor DarkGray
 
     $paths = Read-PathList -Prompt 'Library folder(s) to scan'
-    $csv = Join-Path $PSScriptRoot ('hdr_census_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $csv = Join-Path (Get-Av1LogDirectory) ('hdr_census_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     Invoke-LibraryScanTool -Path $paths -Csv $csv
 }
 
